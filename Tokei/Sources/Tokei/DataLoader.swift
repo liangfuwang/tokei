@@ -398,14 +398,30 @@ final class DataLoader {
         defer { deepSeekPreparationLock.unlock() }
 
         let fm = FileManager.default
-        let sourceRoot: URL
+        // DSH 有 CLI(~/.dsh)与桌面版(dsh-desktop)两处会话目录;TOKEI_DSH_DIR 可用冒号
+        // 分隔覆盖。每个源用 sN/ 前缀隔离,避免同名 --项目--/session-* 目录互相覆盖。
+        let sources: [(tag: String, root: URL)]
         if let configured = ProcessInfo.processInfo.environment["TOKEI_DSH_DIR"],
            !configured.isEmpty {
-            sourceRoot = URL(fileURLWithPath: NSString(string: configured).expandingTildeInPath,
-                             isDirectory: true).standardizedFileURL
+            let paths = configured.split(separator: ":").map(String.init)
+                .filter { !$0.isEmpty }
+            sources = paths.enumerated().map { index, path in
+                (tag: "s\(index)",
+                 root: URL(fileURLWithPath: NSString(string: path).expandingTildeInPath,
+                           isDirectory: true).standardizedFileURL)
+            }
         } else {
-            sourceRoot = fm.homeDirectoryForCurrentUser
-                .appendingPathComponent(".dsh/sessions", isDirectory: true).standardizedFileURL
+            let home = fm.homeDirectoryForCurrentUser
+            sources = [
+                (tag: "s0", root: home.appendingPathComponent(
+                    ".dsh/sessions", isDirectory: true).standardizedFileURL),
+                (tag: "s1", root: home.appendingPathComponent(
+                    "Library/Application Support/dsh-desktop/harness/sessions",
+                    isDirectory: true).standardizedFileURL),
+                (tag: "s2", root: home.appendingPathComponent(
+                    "Library/Application Support/DSH Desktop/harness/sessions",
+                    isDirectory: true).standardizedFileURL),
+            ]
         }
         let outputRoot = deepSeekCacheURL
         try? fm.createDirectory(at: outputRoot, withIntermediateDirectories: true,
@@ -417,46 +433,49 @@ final class DataLoader {
         } ?? [:]
 
         let keys: Set<URLResourceKey> = [.isRegularFileKey, .contentModificationDateKey, .fileSizeKey]
-        guard let enumerator = fm.enumerator(at: sourceRoot, includingPropertiesForKeys: Array(keys),
-                                             options: [.skipsHiddenFiles]) else {
-            return outputRoot
-        }
         var manifest: [String: DeepSeekSourceSignature] = [:]
-        let sourcePrefix = sourceRoot.path.hasSuffix("/") ? sourceRoot.path : sourceRoot.path + "/"
-        for case let source as URL in enumerator {
-            guard source.path.hasSuffix(".jsonl.zstd"),
-                  source.standardizedFileURL.path.hasPrefix(sourcePrefix),
-                  let values = try? source.resourceValues(forKeys: keys),
-                  values.isRegularFile == true,
-                  let modified = values.contentModificationDate,
-                  let size = values.fileSize else { continue }
-            let relative = String(source.standardizedFileURL.path.dropFirst(sourcePrefix.count))
-            let outputRelative = String(relative.dropLast(".zstd".count))
-            let output = outputRoot.appendingPathComponent(outputRelative).standardizedFileURL
-            guard output.path.hasPrefix(outputRoot.path + "/") else { continue }
-            let signature = DeepSeekSourceSignature(modified: modified.timeIntervalSince1970, size: size)
-            if oldManifest[relative] == signature, fm.fileExists(atPath: output.path) {
-                manifest[relative] = signature
-                continue
-            }
-            guard let compressed = try? Data(contentsOf: source, options: .mappedIfSafe),
-                  let decompressed = zstdDecompressFrames(compressed) else {
-                continue
-            }
-            do {
-                try fm.createDirectory(at: output.deletingLastPathComponent(),
-                                       withIntermediateDirectories: true,
-                                       attributes: [.posixPermissions: 0o700])
-                try decompressed.write(to: output, options: .atomic)
-                try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: output.path)
-                manifest[relative] = signature
-            } catch {
-                continue
+        for (tag, sourceRoot) in sources {
+            guard fm.fileExists(atPath: sourceRoot.path),
+                  let enumerator = fm.enumerator(at: sourceRoot,
+                                                 includingPropertiesForKeys: Array(keys),
+                                                 options: [.skipsHiddenFiles]) else { continue }
+            let sourcePrefix = sourceRoot.path.hasSuffix("/") ? sourceRoot.path : sourceRoot.path + "/"
+            for case let source as URL in enumerator {
+                guard source.path.hasSuffix(".jsonl.zstd"),
+                      source.standardizedFileURL.path.hasPrefix(sourcePrefix),
+                      let values = try? source.resourceValues(forKeys: keys),
+                      values.isRegularFile == true,
+                      let modified = values.contentModificationDate,
+                      let size = values.fileSize else { continue }
+                let relative = String(source.standardizedFileURL.path.dropFirst(sourcePrefix.count))
+                let key = "\(tag)/\(relative)"
+                let outputRelative = String(key.dropLast(".zstd".count))
+                let output = outputRoot.appendingPathComponent(outputRelative).standardizedFileURL
+                guard output.path.hasPrefix(outputRoot.path + "/") else { continue }
+                let signature = DeepSeekSourceSignature(modified: modified.timeIntervalSince1970, size: size)
+                if oldManifest[key] == signature, fm.fileExists(atPath: output.path) {
+                    manifest[key] = signature
+                    continue
+                }
+                guard let compressed = try? Data(contentsOf: source, options: .mappedIfSafe),
+                      let decompressed = zstdDecompressFrames(compressed) else {
+                    continue
+                }
+                do {
+                    try fm.createDirectory(at: output.deletingLastPathComponent(),
+                                           withIntermediateDirectories: true,
+                                           attributes: [.posixPermissions: 0o700])
+                    try decompressed.write(to: output, options: .atomic)
+                    try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: output.path)
+                    manifest[key] = signature
+                } catch {
+                    continue
+                }
             }
         }
 
-        for relative in oldManifest.keys where manifest[relative] == nil {
-            let outputRelative = String(relative.dropLast(".zstd".count))
+        for key in oldManifest.keys where manifest[key] == nil {
+            let outputRelative = String(key.dropLast(".zstd".count))
             let output = outputRoot.appendingPathComponent(outputRelative).standardizedFileURL
             if output.path.hasPrefix(outputRoot.path + "/") {
                 try? fm.removeItem(at: output)

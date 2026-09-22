@@ -222,9 +222,10 @@ Dashboard、Wrapped 或项目 token 总量。
 - 输出 = `output_tokens` / `completion_tokens`（`completion_thinking_tokens` 已包含在输出中）
 - 缓存读 = `cache_read_input_tokens` / `prompt_cache_hit_tokens`
 - 缓存写 = `cache_creation_input_tokens` / `prompt_cache_write_tokens`
-- Credit = `providerData.rawUsage.credit`，按模型调用累计，不换算成美元
+- Credit = `providerData.rawUsage.credit`，按模型调用累计；官方价 1,000 积分 = 50 元，成本按 `credits × 0.05` 写入 `cost_cny`（面板按原生人民币展示）
 - 去重优先使用 `sessionId + providerData.messageId`，回退 entry `id`；`conversationRequestId` 只作轮次关联，不能作为去重键
 - 主会话和 `subagents` 都参与统计；`traces`、`logs`、auth 和 transcript 正文不作为数据源
+- IDE 扩展另存一份 `~/Library/Application Support/CodeBuddyExtension/**/history/**/index.json`（`requests[].usage`，`credit` 在 `usage.credit`），与 CLI 的 `~/.codebuddy/projects/**/*.jsonl` 合并统计；IDE 量级通常更大
 
 ---
 
@@ -357,9 +358,11 @@ Pi 优先使用会话 JSONL 中的 `usage.cost.total`；OpenCode 优先读取 SQ
 不估算成本。Grok Build 的 OAuth/订阅交互日志没有完整成本，缺失值不会显示为 0 美元；
 只有 token 参与聚合和排行。
 
-### CodeBuddy Code 成本
+### CodeBuddy Code / WorkBuddy 成本
 
-CodeBuddy 的 `Credit` 是产品原生消耗单位，不等同于美元。Tokei 保留并展示 Credit；只有模型命中明确价格表时才计算美元估算，未知模型的美元成本保持为未知/零估算，不解释为免费。
+两者的托管模型由服务端按 `Credit`（积分）计费，`providerData.rawUsage.credit` 是官方账单值，已经包含模型倍率（`product.ioa.json` 的 `xN credits`）与缓存折扣。Tokei 按官方价 **1,000 积分 = 50 元** 折算成 `cost_cny`（面板按原生人民币展示），有积分时不再用 token 价格表估美元；只有没有 `credit` 的旧记录才回退价格表，结果留在美元 `cost` 字段。计费口径变化由 `_CREDIT_LEDGER_VERSION` 抬高账本版本，避免旧的美元估算被高水位保留。
+
+WorkBuddy 的 `cache_write` 在 Anthropic 风格键（恒 0）与 OpenAI 风格键之间取最大值，且 `rawUsage` 优先于子代理上可能陈旧的 `message.usage`。
 
 ---
 

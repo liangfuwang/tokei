@@ -118,6 +118,17 @@ WORKBUDDY_DIR = os.path.join(HOME, ".workbuddy", "projects")
 WORKBUDDY_AI_DIR = os.path.join(HOME, ".workbuddy-ai", "projects")
 CODEBUDDY_DIR = os.path.abspath(os.path.expanduser(os.environ.get(
     "TOKEI_CODEBUDDY_DIR", os.path.join(HOME, ".codebuddy", "projects"))))
+# CodeBuddy IDE 扩展另存一份 history/**/index.json(量比 CLI 大一个数量级),与 projects/*.jsonl 合并统计。
+CODEBUDDY_IDE_DIRS = _path_candidates(
+    "TOKEI_CODEBUDDY_IDE_DIR",
+    os.path.join(HOME, "Library", "Application Support", "CodeBuddyExtension"),
+    os.path.join(APPDATA, "CodeBuddyExtension"),
+    os.path.join(LOCALAPPDATA, "CodeBuddyExtension"),
+    os.path.join(HOME, ".config", "CodeBuddyExtension"))
+# 腾讯系(CodeBuddy / WorkBuddy)服务端积分账单的官方价:1,000 积分 = 50 元。
+_CREDIT_CNY = 0.05
+# 计费口径版本:积分账单取代价格表估算。抬高版本号,让账本里旧的美元估算被实时值覆盖。
+_CREDIT_LEDGER_VERSION = 3
 GROK_BOT_DIRS = _path_candidates(
     "TOKEI_GROK_BOT_DIR",
     os.path.join(HOME, "Library", "Application Support", "Grok Bot",
@@ -9331,7 +9342,87 @@ def scan_prime_agent(bounds, cache):
 # 两个独立 App 共用解析逻辑,但缓存、账本和展示分别统计。
 # 每个带 usage 的 item 代表一次模型调用。providerData 中的同一份 usage 仅作字段补全，
 # 不重复累计；reasoning_tokens 已包含在 output_tokens 中。
-_WORKBUDDY_PARSER_VERSION = 2
+_WORKBUDDY_PARSER_VERSION = 3
+
+
+def _normalize_agent_model(name):
+    """去掉本地路由前缀/后缀(custom-local: / -ioa),让模型名能落到定价表。"""
+    if not isinstance(name, str):
+        return "unknown"
+    model = name.strip()
+    if model.startswith("custom-local:"):
+        model = model[len("custom-local:"):]
+    model = re.sub(r"-ioa$", "", model).strip()
+    # claude-opus-4-7(-1m) 与 claude-opus-4.7(-1m) 统一成点号写法,避免同模型两条。
+    model = re.sub(r"^(claude-(?:opus|sonnet|haiku))-(\d+)-(\d+)(?=-|$)", r"\1-\2.\3", model)
+    return model or "unknown"
+
+
+def _codebuddy_int(value):
+    if isinstance(value, bool):
+        return 0
+    try:
+        return max(int(value or 0), 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _workbuddy_max_number(obj, *keys):
+    """同一字段有多套候选键时取最大值,避免被 0 遮蔽。
+
+    例:rawUsage 同时有 Anthropic 风格的 `cache_creation_input_tokens`(恒 0)和 OpenAI 风格的
+    `prompt_cache_write_tokens`(真实缓存写),按「第一个存在的键」取会拿到 0。
+    """
+    if not isinstance(obj, dict):
+        return None
+    values = []
+    for key in keys:
+        if key not in obj:
+            continue
+        value = obj.get(key)
+        if isinstance(value, bool):
+            continue
+        try:
+            values.append(max(int(value), 0))
+        except (TypeError, ValueError):
+            continue
+    return max(values) if values else None
+
+
+def _codebuddy_ide_session(path):
+    """IDE 扩展会话目录名 = index.json 的父目录。"""
+    return os.path.basename(os.path.dirname(path))
+
+
+def _codebuddy_ide_request_model(messages_dir, message_ids, cache):
+    """从 index.json 请求引用的 message 文件里取 extra.modelId(JSON 字符串)。"""
+    if not isinstance(message_ids, list):
+        return None
+    for message_id in reversed(message_ids):
+        if not isinstance(message_id, str) or not message_id:
+            continue
+        if message_id in cache:
+            model = cache[message_id]
+        else:
+            model = None
+            try:
+                with open(os.path.join(messages_dir, message_id + ".json"),
+                          "r", encoding="utf-8", errors="replace") as handle:
+                    message = json.load(handle)
+            except (OSError, ValueError, TypeError):
+                message = None
+            extra = message.get("extra") if isinstance(message, dict) else None
+            if isinstance(extra, str):
+                try:
+                    extra = json.loads(extra)
+                except (ValueError, TypeError):
+                    extra = None
+            if isinstance(extra, dict):
+                model = extra.get("modelId")
+            cache[message_id] = model
+        if model:
+            return _normalize_agent_model(model)
+    return None
 
 
 def _workbuddy_number(obj, *keys):
@@ -9400,7 +9491,9 @@ def _workbuddy_usage_record(item, model_id_first=False):
     message_usage = message.get("usage") or {}
     normalized = provider.get("usage") or {}
     raw = provider.get("rawUsage") or {}
-    sources = [x for x in (message_usage, normalized, raw) if isinstance(x, dict) and x]
+    # rawUsage 是本次请求的最新用量;子代理 function_call 上的 message.usage 可能是上一条的
+    # 陈旧快照(实测 prompt 会少算几倍)。raw 优先,normalized 次之,message 兜底。
+    sources = [x for x in (raw, normalized, message_usage) if isinstance(x, dict) and x]
 
     credits = max(
         (_workbuddy_float(source, "credit", "credits") or 0.0 for source in sources),
@@ -9426,17 +9519,17 @@ def _workbuddy_usage_record(item, model_id_first=False):
     total_candidates = []
     for source in sources:
         cache_read_candidates.extend([
-            _workbuddy_number(source, "cache_read_input_tokens", "cacheReadInputTokens",
-                              "cache_read", "cacheRead", "cached_tokens", "cachedTokens") or 0,
+            _workbuddy_max_number(source, "cache_read_input_tokens", "cacheReadInputTokens",
+                                  "cache_read", "cacheRead", "cached_tokens", "cachedTokens") or 0,
             _workbuddy_number(source, "prompt_cache_hit_tokens") or 0,
             _workbuddy_detail_total(source.get("inputTokensDetails"), "cached_tokens", "cachedTokens"),
             _workbuddy_detail_total(source.get("input_tokens_details"), "cached_tokens", "cachedTokens"),
             _workbuddy_detail_total(source.get("prompt_tokens_details"), "cached_tokens", "cachedTokens"),
         ])
         cache_write_candidates.extend([
-            _workbuddy_number(source, "cache_creation_input_tokens", "cacheCreationInputTokens",
-                              "cache_write_input_tokens", "cacheWriteInputTokens",
-                              "prompt_cache_write_tokens", "cache_write", "cacheWrite") or 0,
+            _workbuddy_max_number(source, "cache_creation_input_tokens", "cacheCreationInputTokens",
+                                  "cache_write_input_tokens", "cacheWriteInputTokens",
+                                  "prompt_cache_write_tokens", "cache_write", "cacheWrite") or 0,
         ])
         total = _workbuddy_number(source, "total_tokens", "totalTokens", "total")
         if total is not None:
@@ -9459,8 +9552,9 @@ def _workbuddy_usage_record(item, model_id_first=False):
 
     model_keys = (("requestModelId", "requestModelName") if model_id_first else
                   ("requestModelName", "requestModelId"))
-    model = (provider.get(model_keys[0]) or provider.get(model_keys[1])
-             or provider.get("model") or message.get("model") or item.get("model") or "unknown")
+    model = _normalize_agent_model(
+        provider.get(model_keys[0]) or provider.get(model_keys[1])
+        or provider.get("model") or message.get("model") or item.get("model") or "unknown")
     price = _raw_price(str(model))
     cost = (input_tokens / 1e6 * price["in"] + output / 1e6 * price["out"]
             + cache_read / 1e6 * price["cache_read"]
@@ -9469,6 +9563,11 @@ def _workbuddy_usage_record(item, model_id_first=False):
     # unrecognised model into a guessed dollar estimate; keep the Credit
     # total authoritative and leave USD at zero until an exact price exists.
     if model_id_first and not _exact_pricing_id(_model_identity_id(str(model))):
+        cost = 0.0
+    # 腾讯系(CodeBuddy / WorkBuddy)服务端积分账单是官方口径:1,000 积分 = 50 元。
+    # 有积分时以 ¥ 为准(价格表估的美元退居其次),没有积分才用美元估算兜底。
+    cost_cny = float(credits) * _CREDIT_CNY if credits > 0 else 0.0
+    if cost_cny > 0:
         cost = 0.0
     item_id = item.get("id") or provider.get("messageId") or ""
     return {
@@ -9483,6 +9582,7 @@ def _workbuddy_usage_record(item, model_id_first=False):
         "cw": cache_write,
         "reason": 0,
         "cost": cost,
+        "cost_cny": cost_cny,
         "credits": credits,
         "model": str(model),
         "message_id": str(provider.get("messageId") or ""),
@@ -9517,12 +9617,14 @@ def _iter_workbuddy_records(file_cache):
         yield path, entry, record
 
 
-def _scan_workbuddy_root(bounds, cache, root, tool_key):
+def _scan_workbuddy_root(bounds, cache, root, tool_key, extra_files=None, extra_parser=None):
     ledger_touch(tool_key)
     fc = cache.setdefault(tool_key, {})
     B = _empty_token_ranges()
     files = (set(glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True))
              if os.path.isdir(root) else set())
+    extra_file_set = set(extra_files or ())
+    files |= extra_file_set
     stale = set(fc.keys())
     changed = False
     for path in sorted(files):
@@ -9534,6 +9636,15 @@ def _scan_workbuddy_root(bounds, cache, root, tool_key):
         sig = f"{st.st_mtime}:{st.st_size}"
         if (isinstance(fc.get(path), dict) and fc[path].get("sig") == sig
                 and fc[path].get("parser") == _WORKBUDDY_PARSER_VERSION):
+            continue
+
+        if extra_parser is not None and path in extra_file_set:
+            parsed = extra_parser(path)
+            if parsed is not None:
+                fc[path] = {"sig": sig, "parser": _WORKBUDDY_PARSER_VERSION,
+                            "records": parsed.get("records", []),
+                            "proj": parsed.get("proj"), "sid": parsed.get("sid")}
+                changed = True
             continue
 
         records = []
@@ -9587,11 +9698,15 @@ def _scan_workbuddy_root(bounds, cache, root, tool_key):
                                   record["date"], record, record.get("hour"))
         day = days.setdefault(record["date"], _empty_token_day())
         _add_token_usage(day, record["in"], record["out"], record["cr"], record["cw"],
-                         0, record["cost"], record["model"], credits=record.get("credits", 0))
+                         0, record["cost"], record["model"], credits=record.get("credits", 0),
+                         cost_cny=record.get("cost_cny", 0.0))
         sessions.setdefault(record["date"], set()).add(record.get("session") or "unknown")
         proj_name = os.path.basename((entry.get("proj") or "").rstrip("/"))
         if proj_name:
             day_projects.setdefault(record["date"], set()).add(proj_name)
+    # 计费口径变了(积分账单),抬高账本版本,旧的价格表美元成本会被实时值覆盖。
+    for day in days.values():
+        day["_ledger_version"] = _CREDIT_LEDGER_VERSION
     # 项目名随天入账本(同 scan_claude):日志被清理后仍能回答"那天在干什么"。
     for day_key, names in day_projects.items():
         days[day_key]["projects"] = sorted(names)[:3]
@@ -9625,8 +9740,73 @@ def scan_workbuddy_ai(bounds, cache):
     return _scan_workbuddy_root(bounds, cache, WORKBUDDY_AI_DIR, "workbuddy_ai")
 
 
+def _parse_codebuddy_ide_file(path):
+    """CodeBuddy IDE history/<hash>/<session>/index.json → 与 CLI 同构的用量记录。"""
+    sid = _codebuddy_ide_session(path)
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            data = json.load(handle)
+    except OSError:
+        return None
+    except (ValueError, TypeError):
+        data = None
+    requests = data.get("requests") if isinstance(data, dict) else None
+    if not isinstance(requests, list):
+        return {"records": [], "proj": None, "sid": sid}
+    messages_dir = os.path.join(os.path.dirname(path), "messages")
+    model_cache = {}
+    records = []
+    for request in requests:
+        if not isinstance(request, dict):
+            continue
+        usage = request.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        ts = request.get("startedAt")
+        if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+            continue
+        prompt = _codebuddy_int(usage.get("inputTokens"))
+        output = _codebuddy_int(usage.get("outputTokens"))
+        cache_read = min(_codebuddy_int(usage.get("cacheTokens")), prompt)
+        cache_write = min(_codebuddy_int(usage.get("cachedWriteTokens")),
+                          max(prompt - cache_read, 0))
+        inp = prompt - cache_read - cache_write
+        if inp + output + cache_read + cache_write == 0:
+            continue
+        model = _codebuddy_ide_request_model(
+            messages_dir, request.get("messages"), model_cache) or "unknown"
+        credits = usage.get("credit")
+        if isinstance(credits, bool) or not isinstance(credits, (int, float)) or credits <= 0:
+            credits = 0.0
+        cost_cny = float(credits) * _CREDIT_CNY if credits else 0.0
+        cost = 0.0
+        if not cost_cny and model != "unknown" and (
+                "cacheTokens" in usage or "cachedWriteTokens" in usage):
+            # 老请求没有 credit 才回退价格表;且必须能还原缓存占比,否则会虚高数十倍。
+            price = _raw_price(model)
+            cost = (inp / 1e6 * price["in"] + output / 1e6 * price["out"]
+                    + cache_read / 1e6 * price["cache_read"]
+                    + cache_write / 1e6 * price["cache_write"])
+        dt = datetime.fromtimestamp(ts / 1000.0).astimezone()
+        rid = str(request.get("id") or "")
+        records.append({
+            "date": dt.date().isoformat(), "hour": dt.hour, "ts": dt.timestamp(),
+            "ts_key": str(ts), "item_id": rid, "message_id": rid,
+            "in": inp, "out": output, "cr": cache_read, "cw": cache_write,
+            "reason": 0, "cost": cost, "cost_cny": cost_cny, "credits": float(credits),
+            "model": str(model), "session": sid,
+            "dedup": json.dumps([sid, rid or path, str(ts)], separators=(",", ":")),
+        })
+    return {"records": records, "proj": None, "sid": sid}
+
+
 def scan_codebuddy(bounds, cache):
-    return _scan_workbuddy_root(bounds, cache, CODEBUDDY_DIR, "codebuddy")
+    ide_files = set()
+    for base in _existing_dirs(CODEBUDDY_IDE_DIRS):
+        ide_files.update(glob.glob(os.path.join(base, "**", "history", "**", "index.json"),
+                                   recursive=True))
+    return _scan_workbuddy_root(bounds, cache, CODEBUDDY_DIR, "codebuddy",
+                                extra_files=ide_files, extra_parser=_parse_codebuddy_ide_file)
 
 
 # ---------- Grok Bot ----------
@@ -12830,6 +13010,10 @@ def _recalc_costs(result):
                     reason = m.get("reason", 0)
                     cost = (ti / 1e6 * p["in"] + (to + reason) / 1e6 * p["out"]
                             + cr / 1e6 * p["cache_read"])
+                elif tool_key in ("workbuddy", "workbuddy_ai", "codebuddy"):
+                    # 腾讯系按服务端积分账单计费(扫描阶段已写进 cost_cny),
+                    # 不能按聚合 token 重算,否则会把积分账单冲成价格表估算。
+                    cost = authoritative_cost
                 else:
                     cr = m.get("cr", 0)
                     cw = m.get("cw", 0)
