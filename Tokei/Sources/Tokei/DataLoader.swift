@@ -606,6 +606,10 @@ final class DataLoader {
                     }
                 }
                 normalizeClaudeQuota(&claude)
+                if claudeCLIQuotaEnabled {
+                    let extras = ClaudeCLIQuotaBridge.fetchExtraAccountQuotas()
+                    if !extras.isEmpty { claude["extra_accounts"] = extras }
+                }
                 raw["claude"] = claude
             }
             let cleaned = try JSONSerialization.data(withJSONObject: raw)

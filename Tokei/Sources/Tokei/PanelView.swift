@@ -58,6 +58,8 @@ struct PanelView: View {
         let tint: Color
         var presentation: ToolCardPresentation = .standard
         let content: AnyView
+        /// 当前所选时间范围内的 token 用量，卡片按它从大到小排。
+        var usage: Int = 0
     }
     @AppStorage("showClaude") private var showClaude = true
     @AppStorage("showCodex") private var showCodex = true
@@ -249,7 +251,7 @@ struct PanelView: View {
             } else if let u = store.usage {
                 let cards = toolCards(for: u)
                 SegmentedTabs(sel: $sel)
-                toolCardsLayout(cards.filter { $0.visible && $0.active })
+                toolCardsLayout(Self.sortedByUsage(cards.filter { $0.visible && $0.active }))
                 inactiveToolsLine(cards)
             } else {
                 HStack(spacing: 8) {
@@ -399,7 +401,8 @@ struct PanelView: View {
     }
 
     private func toolCards(for u: Usage) -> [ToolCardItem] {
-        let cr = u.claude.ranges.get(sel), xr = u.codex.ranges.get(sel)
+        let claudeMain = u.claude.primaryAccount
+        let cr = claudeMain.ranges.get(sel), xr = u.codex.ranges.get(sel)
         let geminiRange = u.gemini.ranges.get(sel)
         let kr = u.grok.ranges.get(sel)
         let grokBotDisplay: (key: RangeKey, range: QoderRange, usage: TokenUsageRange) = {
@@ -435,12 +438,28 @@ struct PanelView: View {
         let qcr = u.qwencode.ranges.get(sel), kcr = u.kimicode.ranges.get(sel)
         let mcr = u.musecode.ranges.get(sel), ccr = u.cmdcode.ranges.get(sel)
         let dvr = u.devin.ranges.get(sel), mmr = u.minimax.ranges.get(sel)
-        return [
+        let usageByID: [String: Int] = [
+            "claude": cr.tokens, "codex": xr.tokens, "gemini": geminiRange.totalTokens,
+            "cursor": cursorUsage.totalTokens, "zai": zaiUsage.totalTokens, "grok": kr.tokens,
+            "grok-bot": max(grokBotDisplay.range.totalTokens, grokBotDisplay.usage.totalTokens),
+            "qoder": qr.in + qr.cached + qr.out, "qoderwork": qwr.totalTokens,
+            "qodercli": qclir.totalTokens, "qodercli_cn": qclicnr.totalTokens,
+            "hermes": hr.in + hr.out + hr.cr + hr.cw + hr.reason,
+            "zcode": zr.totalTokens, "mimocode": mr.totalTokens,
+            "openclaw": lr.in + lr.out + lr.cr + lr.cw + lr.reason,
+            "pi": pr.totalTokens, "prime_agent": par.totalTokens,
+            "workbuddy": wr.totalTokens, "workbuddy-ai": wair.totalTokens,
+            "codebuddy": cbr.totalTokens, "deepseek_harness": dshr.totalTokens,
+            "opencode": or.totalTokens, "qwencode": qcr.totalTokens,
+            "devin": dvr.totalTokens, "minimax": mmr.totalTokens,
+            "kimicode": kcr.totalTokens, "musecode": mcr.totalTokens, "cmdcode": ccr.totalTokens,
+        ]
+        let items: [ToolCardItem] = [
             ToolCardItem(id: "claude", name: "Claude", visible: showClaude,
-                         active: cr.sessions > 0 || u.claude.q5 != nil ||
-                             u.claude.q7 != nil || u.claude.qf != nil,
+                         active: cr.sessions > 0 || claudeMain.q5 != nil ||
+                             claudeMain.q7 != nil || claudeMain.qf != nil,
                          tint: Theme.claude,
-                         content: AnyView(claudeBlock(u.claude, cr))),
+                         content: AnyView(claudeBlock(claudeMain, cr))),
             ToolCardItem(id: "codex", name: "Codex", visible: showCodex,
                          active: xr.sessions > 0 || u.codex.p5 != nil || u.codex.pw != nil ||
                              (u.codex.reset_cards?.count ?? 0) > 0,
@@ -573,6 +592,38 @@ struct PanelView: View {
             ToolCardItem(id: "cmdcode", name: "Command Code", visible: showCmdCode, active: ccr.sessions > 0,
                          tint: Theme.cmdcode, content: AnyView(tokenUsageBlock(title: "Command Code", ccr, tint: Theme.cmdcode, modelsOpen: $cmdCodeModelsOpen, toolID: "cmdcode"))),
         ]
+        // 额外 Claude Code 账号各自一张卡，紧跟默认账号；排序时再按各自用量归位。
+        let accountCards: [ToolCardItem] = u.claude.accountNames.map { name in
+            let stat = u.claude.account(name)
+            let range = stat.ranges.get(sel)
+            let title = "Claude Code · \(name)"
+            return ToolCardItem(
+                id: "claude-\(name)", name: title, visible: showClaude,
+                active: range.sessions > 0 || range.tokens > 0 ||
+                    stat.q5 != nil || stat.q7 != nil || stat.qf != nil,
+                tint: Theme.claude,
+                content: AnyView(claudeBlock(stat, range, title: title, toolID: nil)),
+                usage: range.tokens)
+        }
+        var all = items
+        all.insert(contentsOf: accountCards, at: min(1, all.count))
+        return all.map { item in
+            var item = item
+            item.usage = usageByID[item.id] ?? item.usage
+            return item
+        }
+    }
+
+    /// 用量大的排前面：网格按「左→右、再下一行」摆放，所以最多的在左上。
+    /// 用量相同（含都为 0）时保持原有顺序。
+    private static func sortedByUsage(_ cards: [ToolCardItem]) -> [ToolCardItem] {
+        cards.enumerated()
+            .sorted { a, b in
+                a.element.usage != b.element.usage
+                    ? a.element.usage > b.element.usage
+                    : a.offset < b.offset
+            }
+            .map(\.element)
     }
 
     @ViewBuilder
@@ -615,14 +666,15 @@ struct PanelView: View {
 
     // MARK: - Claude 卡片
     @ViewBuilder
-    func claudeBlock(_ c: ClaudeStat, _ r: ClaudeRange) -> some View {
+    func claudeBlock(_ c: ClaudeStat, _ r: ClaudeRange, title: String = "Claude Code",
+                     toolID: String? = "claude") -> some View {
         let quotaState = SubscriptionQuotaState.resolve([
             (value: c.q5, stale: c.q5_stale),
             (value: c.q7, stale: c.q7_stale),
             (value: c.qf, stale: c.qf_stale),
         ])
         VStack(alignment: .leading, spacing: 11) {
-            cardHead("Claude Code", tint: Theme.claude, sessions: r.sessions, toolID: "claude")
+            cardHead(title, tint: Theme.claude, sessions: r.sessions, toolID: toolID)
             if r.sessions > 0 {
                 CostHeadline(value: Fmt.human(r.in + r.out + r.cr + r.cw), caption: L("%@ 总量", sel.label), tint: Theme.claude)
                 metricGrid([

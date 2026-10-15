@@ -2498,6 +2498,94 @@ def _claude_attach_perf(events, when, via=None):
         event.pop("think_ms", None)
 
 
+def _claude_extra_accounts():
+    """~/.claude-<name>：设了 CLAUDE_CONFIG_DIR 的额外 Claude Code 账号（登录过的才算）。只读。"""
+    try:
+        names = sorted(os.listdir(HOME))
+    except OSError:
+        return []
+    out = []
+    for name in names:
+        if not name.startswith(".claude-") or len(name) <= len(".claude-"):
+            continue
+        path = os.path.join(HOME, name)
+        if os.path.isfile(os.path.join(path, ".claude.json")):
+            out.append((name[len(".claude-"):], path))
+    return out
+
+
+def _claude_session_owners(cache):
+    """会话 → [[提问时间(ms), 账号名], ...]，账号名为空串表示默认账号。
+
+    各账号的 history.jsonl 逐条记录「哪个会话、什么时间、提了问」，两个账号共用 projects
+    目录时，这是区分用量归属的唯一依据。只读这些文件，且只保留出现在额外账号里的会话；
+    没有额外账号时直接返回空，用量统计与原来完全一致。"""
+    accounts = _claude_extra_accounts()
+    if not accounts:
+        return {}
+    sources = [(name, os.path.join(path, "history.jsonl")) for name, path in accounts]
+    sources.append(("", os.path.join(HOME, ".claude", "history.jsonl")))
+    parts = []
+    for name, path in sources:
+        try:
+            st = os.stat(path)
+            parts.append(f"{name}:{st.st_mtime}:{st.st_size}")
+        except OSError:
+            parts.append(f"{name}:-")
+    sig = "|".join(parts)
+    stored = cache.get("claude_owners")
+    if isinstance(stored, dict) and stored.get("sig") == sig:
+        return stored.get("map") or {}
+    entries = {}
+    extra_sessions = set()
+    for name, path in sources:          # 额外账号在前，默认账号最后（只收已知会话）
+        try:
+            handle = open(path, "r", encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        with handle:
+            for line in handle:
+                try:
+                    o = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(o, dict):
+                    continue
+                sid, ts = o.get("sessionId"), o.get("timestamp")
+                if not isinstance(sid, str) or not isinstance(ts, (int, float)):
+                    continue
+                if name:
+                    extra_sessions.add(sid)
+                elif sid not in extra_sessions:
+                    continue
+                entries.setdefault(sid, []).append([int(ts), name])
+    owners = {sid: sorted(seq) for sid, seq in entries.items()}
+    cache["claude_owners"] = {"sig": sig, "map": owners}
+    cache["_dirty"] = True
+    return owners
+
+
+def _claude_session_id(path):
+    """projects/<项目>/<会话>.jsonl 或 projects/<项目>/<会话>/subagents/*.jsonl → 会话 ID。"""
+    parts = os.path.relpath(path, CLAUDE_DIR).split(os.sep)
+    if len(parts) >= 3:
+        return parts[1]
+    return parts[-1][:-6] if parts[-1].endswith(".jsonl") else parts[-1]
+
+
+def _claude_owner(owners, owner_times, sid, ts_ms):
+    """事件发生时该会话最近一次提问所在的账号；没有记录的会话归默认账号。"""
+    seq = owners.get(sid)
+    if not seq:
+        return ""
+    times = owner_times.get(sid)
+    if times is None:
+        times = owner_times[sid] = [item[0] for item in seq]
+    import bisect
+    index = bisect.bisect_right(times, ts_ms) - 1
+    return seq[max(index, 0)][1]
+
+
 def scan_claude(bounds, cache):
     fc = cache.setdefault("claude", {})
     changed = False
@@ -2561,12 +2649,39 @@ def scan_claude(bounds, cache):
                "proj": entry.get("proj")}
         for path, entry in fc.items()
     }
+    owners = _claude_session_owners(cache)
+    owner_times = {}
+    session_ids = {}
+    account_days = {}   # 账号 -> 日 -> 用量；只是总量的子集，总量的算法不变
     for path, event in selected_events:
         dt = parse_ts(event.get("timestamp", ""))
         if dt is None:
             continue
         dt = dt.astimezone()
         day_key = dt.date().isoformat()
+        if owners:
+            sid = session_ids.get(path)
+            if sid is None:
+                sid = session_ids[path] = _claude_session_id(path)
+            account = _claude_owner(owners, owner_times, sid, dt.timestamp() * 1000)
+            if account:
+                part = account_days.setdefault(account, {}).setdefault(
+                    day_key, {"in": 0, "out": 0, "cr": 0, "cw": 0, "cost": 0.0,
+                              "models": {}, "files": set()})
+                part["in"] += event["in"]; part["out"] += event["out"]
+                part["cr"] += event["cr"]; part["cw"] += event["cw"]
+                part["cost"] += event["cost"]
+                part_model = part["models"].setdefault(
+                    event.get("model") or "unknown",
+                    {"in": 0, "out": 0, "cr": 0, "cw": 0, "cost": 0.0})
+                part_model["in"] += event["in"]; part_model["out"] += event["out"]
+                part_model["cr"] += event["cr"]; part_model["cw"] += event["cw"]
+                part_model["cost"] += event["cost"]
+                part_timing = event.get("perf")
+                if part_timing:
+                    _perf_add(part.setdefault("perf", {}), event.get("model"), event["out"],
+                              part_timing[0], part_timing[1] if len(part_timing) > 1 else None)
+                part["files"].add(path)
         aggregate = aggregates[path]
         if not aggregate["proj"] and event.get("cwd"):
             aggregate["proj"] = event["cwd"]
@@ -2664,6 +2779,28 @@ def scan_claude(bounds, cache):
             if day.get("perf"):
                 _perf_merge(b.setdefault("perf", {}), day["perf"])
 
+    account_ranges = {}
+    for account, days in account_days.items():
+        part = {k: {"in": 0, "out": 0, "cr": 0, "cw": 0, "cost": 0.0, "models": {},
+                    "sessions": set()} for k in RANGE_KEYS}
+        for dk, day in days.items():
+            try:
+                d = date.fromisoformat(dk)
+            except ValueError:
+                continue
+            for k in classify(d):
+                b = part[k]
+                b["in"] += day["in"]; b["out"] += day["out"]
+                b["cr"] += day["cr"]; b["cw"] += day["cw"]; b["cost"] += day["cost"]
+                for mn, mv in day["models"].items():
+                    mm = b["models"].setdefault(mn, {"in": 0, "out": 0, "cr": 0, "cw": 0, "cost": 0.0})
+                    mm["in"] += mv["in"]; mm["out"] += mv["out"]
+                    mm["cr"] += mv["cr"]; mm["cw"] += mv["cw"]; mm["cost"] += mv["cost"]
+                if day.get("perf"):
+                    _perf_merge(b.setdefault("perf", {}), day["perf"])
+                b["sessions"] |= day["files"]
+        account_ranges[account] = part
+
     # Current session: sum all days of the most recently modified file
     cur_in = cur_out = cur_cr = cur_cw = 0
     if cur_file:
@@ -2675,6 +2812,7 @@ def scan_claude(bounds, cache):
 
     return {
         "ranges": B,
+        "accounts": account_ranges,
         "cur": {"in": cur_in, "out": cur_out, "cr": cur_cr, "cw": cur_cw,
                 "name": os.path.basename(cur_file)[:8] if cur_file else "-"},
     }
@@ -15016,6 +15154,11 @@ def compute():
                 "ctx": ctx, "duration": b.get("duration", 0)}
 
     cranges = {k: claude_range(cc["ranges"][k]) for k in RANGE_KEYS}
+    # 额外账号的用量只是总量的子集：总量（ranges）不变，界面用「总量 − 额外账号」得到默认账号。
+    claude_account_usage = {
+        name: {k: claude_range(part[k]) for k in RANGE_KEYS}
+        for name, part in (cc.get("accounts") or {}).items()
+    }
     xranges = {k: codex_range(cx["ranges"][k]) for k in RANGE_KEYS}
     xreserveranges = {k: codex_range(cx.get("reserve_ranges", {}).get(k, {}))
                       for k in RANGE_KEYS}
@@ -15147,6 +15290,7 @@ def compute():
             "q_updated": plan.get("q_updated"),
             "q5_stale": plan.get("q5_stale"), "q7_stale": plan.get("q7_stale"),
             "qf_stale": plan.get("qf_stale"),
+            **({"account_usage": claude_account_usage} if claude_account_usage else {}),
         },
         "codex": {
             "ranges": xranges,

@@ -180,6 +180,21 @@ struct ClaudeRanges: Codable {
     }
 }
 
+/// 额外 Claude Code 账号（~/.claude-<name>）的额度，只有额度，用量仍并入 ClaudeStat.ranges。
+struct ClaudeAccountQuota: Codable {
+    var name: String
+    var q5: Double?
+    var q5_reset: Int?
+    var q7: Double?
+    var q7_reset: Int?
+    var qf: Double?
+    var qf_reset: Int?
+    var q_updated: Int?
+    var q5_stale: Bool?
+    var q7_stale: Bool?
+    var qf_stale: Bool?
+}
+
 struct ClaudeStat: Codable {
     var ranges: ClaudeRanges
     var session_name: String
@@ -194,6 +209,139 @@ struct ClaudeStat: Codable {
     var q5_stale: Bool?
     var q7_stale: Bool?
     var qf_stale: Bool?
+    var extra_accounts: [ClaudeAccountQuota]?
+    /// 额外账号（~/.claude-<name>）名下的用量，是 ranges 总量的子集。
+    var account_usage: [String: ClaudeRanges]?
+}
+
+extension PerfModelStat {
+    /// 从合计里减去子集的速度样本；缺少累加值时没法精确相减，原样保留。
+    func subtracting(_ other: PerfModelStat) -> PerfModelStat? {
+        let remaining = n - other.n
+        guard remaining > 0 else { return nil }
+        guard let o, let g, let otherO = other.o, let otherG = other.g else { return self }
+        var result = PerfModelStat(tps: tps, ttft: ttft, n: remaining)
+        let outTokens = max(o - otherO, 0)
+        let seconds = max(g - otherG, 0)
+        result.o = outTokens
+        result.g = seconds
+        if seconds > 0 { result.tps = (Double(outTokens) / seconds * 10).rounded() / 10 }
+        if let th, let otherTh = other.th {
+            var hist = th
+            for (bucket, count) in otherTh {
+                let left = (hist[bucket] ?? 0) - count
+                if left > 0 { hist[bucket] = left } else { hist.removeValue(forKey: bucket) }
+            }
+            result.th = hist
+            result.tn = hist.values.reduce(0, +)
+            result.ttft = PerfModelStat.median(hist)
+        } else {
+            result.tn = tn
+            result.ttft = ttft
+        }
+        return result
+    }
+}
+
+extension PerfStat {
+    func subtracting(_ other: PerfStat?) -> PerfStat? {
+        guard let other else { return self }
+        guard let total = overall.subtracting(other.overall) else { return nil }
+        var rest: [String: PerfModelStat] = [:]
+        for (name, stat) in models ?? [:] {
+            if let part = other.models?[name] {
+                if let left = stat.subtracting(part) { rest[name] = left }
+            } else {
+                rest[name] = stat
+            }
+        }
+        return PerfStat(tps: total.tps, ttft: total.ttft, n: total.n, o: total.o, g: total.g,
+                        tn: total.tn, th: total.th, models: rest.isEmpty ? nil : rest)
+    }
+}
+
+extension ClaudeRange {
+    static let zero = ClaudeRange(hit: 0, in: 0, out: 0, cr: 0, cw: 0, cost: 0)
+
+    /// 总量减去其中一个账号的用量，得到其余账号；合计恒等于原来的总量。
+    func subtracting(_ other: ClaudeRange) -> ClaudeRange {
+        let input = max(self.in - other.in, 0)
+        let output = max(out - other.out, 0)
+        let cacheRead = max(cr - other.cr, 0)
+        let cacheWrite = max(cw - other.cw, 0)
+        let denom = cacheRead + cacheWrite + input
+        var rest: [ClaudeModelStat] = []
+        for model in models {
+            var m = model
+            if let part = other.models.first(where: { $0.name == m.name }) {
+                m.in = max(m.in - part.in, 0)
+                m.out = max(m.out - part.out, 0)
+                m.cr = max(m.cr - part.cr, 0)
+                m.cw = max(m.cw - part.cw, 0)
+                m.cost = max(m.cost - part.cost, 0)
+                // 减完什么都不剩的模型说明它只被额外账号用过，这张卡上不再列出。
+                if m.total == 0 && m.cost == 0 { continue }
+            }
+            rest.append(m)
+        }
+        return ClaudeRange(
+            hit: denom > 0 ? Double(cacheRead) / Double(denom) * 100 : 0,
+            in: input, out: output, cr: cacheRead, cw: cacheWrite,
+            cost: max(cost - other.cost, 0), models: rest,
+            sessions: max(sessions - other.sessions, 0),
+            perf: perf?.subtracting(other.perf))
+    }
+}
+
+extension ClaudeRanges {
+    static let zero = ClaudeRanges(
+        today: .zero, yesterday: .zero, week: .zero, last_week: .zero,
+        month: .zero, year: .zero, all: .zero)
+
+    func subtracting(_ other: ClaudeRanges) -> ClaudeRanges {
+        ClaudeRanges(
+            today: today.subtracting(other.today),
+            yesterday: yesterday.subtracting(other.yesterday),
+            week: week.subtracting(other.week),
+            last_week: last_week.subtracting(other.last_week),
+            month: month.subtracting(other.month),
+            year: year.subtracting(other.year),
+            all: get(.all).subtracting(other.get(.all)))
+    }
+}
+
+extension ClaudeStat {
+    /// 有数据的额外账号名（用量或额度任一方有就算）。
+    var accountNames: [String] {
+        Set((account_usage ?? [:]).keys).union((extra_accounts ?? []).map(\.name)).sorted()
+    }
+
+    /// 默认账号：总量减去所有额外账号的用量。
+    var primaryAccount: ClaudeStat {
+        var stat = self
+        for part in (account_usage ?? [:]).values {
+            stat.ranges = stat.ranges.subtracting(part)
+        }
+        stat.extra_accounts = nil
+        stat.account_usage = nil
+        return stat
+    }
+
+    /// 某个额外账号自己的用量和额度。
+    func account(_ name: String) -> ClaudeStat {
+        var stat = self
+        stat.ranges = account_usage?[name] ?? .zero
+        let quota = extra_accounts?.first { $0.name == name }
+        stat.q5 = quota?.q5; stat.q5_reset = quota?.q5_reset; stat.q5_stale = quota?.q5_stale
+        stat.q7 = quota?.q7; stat.q7_reset = quota?.q7_reset; stat.q7_stale = quota?.q7_stale
+        stat.qf = quota?.qf; stat.qf_reset = quota?.qf_reset; stat.qf_stale = quota?.qf_stale
+        stat.q_updated = quota?.q_updated
+        stat.session_name = "-"
+        stat.session_total = 0
+        stat.extra_accounts = nil
+        stat.account_usage = nil
+        return stat
+    }
 }
 
 struct CodexRange: Codable {

@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 private final class ClaudeQuotaNoRedirectDelegate: NSObject, URLSessionTaskDelegate {
@@ -59,15 +60,49 @@ enum ClaudeCLIQuotaBridge {
             .appendingPathComponent(".tokei/claude_cli_quota_cache.json")
     }
 
+    private static let defaultKeychainService = "Claude Code-credentials"
+
     static func fetchQuota(now: Date = Date()) -> [String: Any]? {
         lock.lock()
         defer { lock.unlock() }
         return fetchQuota(
             nowEpoch: Int(now.timeIntervalSince1970),
             cacheURL: cacheURL,
-            credentialLoader: loadCredential,
+            credentialLoader: { loadCredential(service: defaultKeychainService) },
             requester: requestQuota
         )
+    }
+
+    /// 额外的 Claude Code 账号：设了 CLAUDE_CONFIG_DIR 的账号，凭据在钥匙串的
+    /// "Claude Code-credentials-<sha256(配置目录)前 8 位>" 条目里。这里只认 ~/.claude-* 目录
+    /// （目录里要有 .claude.json，即登录过），每个账号单独缓存、单独限频。
+    static func fetchExtraAccountQuotas(now: Date = Date()) -> [[String: Any]] {
+        lock.lock()
+        defer { lock.unlock() }
+        let nowEpoch = Int(now.timeIntervalSince1970)
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: home.path)) ?? []
+        var out: [[String: Any]] = []
+        for name in names.sorted() where name.hasPrefix(".claude-") && name.count > ".claude-".count {
+            let dir = home.appendingPathComponent(name)
+            guard FileManager.default.fileExists(
+                atPath: dir.appendingPathComponent(".claude.json").path
+            ) else { continue }
+            let digest = SHA256.hash(data: Data(dir.path.utf8))
+            let hash = digest.prefix(4).map { String(format: "%02x", $0) }.joined()
+            let service = "\(defaultKeychainService)-\(hash)"
+            let cache = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".tokei/claude_cli_quota_cache_\(hash).json")
+            guard var quota = fetchQuota(
+                nowEpoch: nowEpoch,
+                cacheURL: cache,
+                credentialLoader: { loadCredential(service: service) },
+                requester: requestQuota
+            ) else { continue }
+            quota["name"] = String(name.dropFirst(".claude-".count))
+            out.append(quota)
+        }
+        return out
     }
 
     static func fetchQuota(
@@ -133,7 +168,7 @@ enum ClaudeCLIQuotaBridge {
         return dictionary(from: snapshot, nowEpoch: nowEpoch)
     }
 
-    private static func loadCredential() -> Credential? {
+    private static func loadCredential(service: String) -> Credential? {
         let executable = "/usr/bin/security"
         guard FileManager.default.isExecutableFile(atPath: executable) else { return nil }
 
@@ -141,7 +176,7 @@ enum ClaudeCLIQuotaBridge {
         let output = Pipe()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = [
-            "find-generic-password", "-s", "Claude Code-credentials", "-w",
+            "find-generic-password", "-s", service, "-w",
         ]
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = output
