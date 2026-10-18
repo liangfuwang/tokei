@@ -57,10 +57,10 @@ run_tests() {
     local base="${BASE_COMMIT:-}"
     if [ -n "$base" ]; then
         git worktree add --quiet --detach "$base_wt" "$base"
-        ( cd "$base_wt" && python3 -m unittest discover -s tests >"$base_log" 2>&1 || true ) &
+        # 先后跑，不能并行：两套测试同时跑会争用共享的临时状态，出现假失败
+        ( cd "$base_wt" && python3 -m unittest discover -s tests >"$base_log" 2>&1 || true )
     fi
     python3 -m unittest discover -s tests >"$new_log" 2>&1 || true
-    wait
     tail -3 "$new_log"
     if [ -n "$base" ]; then
         local added
