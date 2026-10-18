@@ -105,6 +105,7 @@
 "≈成本" = "≈Cost";
 "≈成本未计入没有公开价的模型：%@" = "≈Cost excludes models without a public price: %@";
 "未计费" = "Unpriced";
+"上游已发布 %@；本地版含定制，需先同步合并再打包，不能直接升级" = "Upstream released %@. This local build carries customizations: sync and rebuild first, it can't upgrade directly";
 "一个周额度用了多少" = "Weekly quota used";
 "万亿先生" = "Trillion Club";
 "上周" = "Last Week";
