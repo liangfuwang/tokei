@@ -270,5 +270,36 @@ class WorkBuddyScanTests(unittest.TestCase):
         )
 
 
+class TencentCreditLedgerTests(unittest.TestCase):
+    def test_old_ledger_day_is_billed_in_yuan_from_day_credits(self):
+        # 旧解析器写下的天：有积分，却按价格表记了美元、人民币为 0。
+        day = {"credits": 100.0, "cost": 3.0, "cost_cny": 0,
+               "models": {"claude-opus-5": {"credits": 100.0, "cost": 2.0, "cost_cny": 0},
+                          "relay-model": {"credits": 0, "cost": 1.0, "cost_cny": 0}}}
+        fixed = USAGE._tencent_credit_day(day)
+        self.assertAlmostEqual(fixed["cost_cny"], 100.0 * USAGE._CREDIT_CNY)
+        self.assertAlmostEqual(fixed["models"]["claude-opus-5"]["cost_cny"], 5.0)
+        self.assertEqual(fixed["models"]["claude-opus-5"]["cost"], 0.0)
+        self.assertAlmostEqual(fixed["cost"], 1.0)  # 只剩没积分模型的美元
+        self.assertEqual(fixed["models"]["relay-model"]["cost"], 1.0)
+        self.assertEqual(day["cost"], 3.0)  # 不改原数据
+
+    def test_leftover_model_entry_loses_dollars_without_gaining_yuan(self):
+        # 模型表残留写法不同的旧条目：积分没进天级合计，美元却进了。
+        day = {"credits": 100.0, "cost": 4.0, "cost_cny": 5.0,
+               "models": {"claude-opus-4.7": {"credits": 100.0, "cost": 0, "cost_cny": 5.0},
+                          "claude-opus-4-7": {"credits": 300.0, "cost": 4.0, "cost_cny": 0}}}
+        fixed = USAGE._tencent_credit_day(day)
+        self.assertAlmostEqual(fixed["cost_cny"], 5.0)
+        self.assertAlmostEqual(fixed["cost"], 0.0)
+        self.assertEqual(fixed["models"]["claude-opus-4-7"]["cost"], 0.0)
+        self.assertEqual(fixed["models"]["claude-opus-4-7"]["cost_cny"], 0.0)
+
+    def test_day_already_on_credit_billing_is_returned_unchanged(self):
+        day = {"credits": 10.0, "cost": 0, "cost_cny": 0.5,
+               "models": {"m": {"credits": 10.0, "cost": 0, "cost_cny": 0.5}}}
+        self.assertIs(USAGE._tencent_credit_day(day), day)
+
+
 if __name__ == "__main__":
     unittest.main()

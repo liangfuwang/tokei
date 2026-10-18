@@ -79,6 +79,7 @@
 "· %@ 天活跃" = "· %@ jours actifs";
 "≈成本" = "≈Coût";
 "≈成本未计入没有公开价的模型：%@" = "Le coût ≈ exclut les modèles sans prix public : %@";
+"未计费" = "Non facturé";
 "一个周额度用了多少" = "Quota hebdomadaire consommé";
 "上周" = "Sem. passée";
 "上次更新 %@" = "Dernière mise à jour %@";

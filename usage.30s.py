@@ -11521,6 +11521,58 @@ def _workbuddy_log_timing(cache, tool_key, root):
     return timing
 
 
+_TENCENT_CREDIT_TOOLS = ("workbuddy", "workbuddy_ai", "codebuddy")
+
+
+def _tencent_credit_values(values):
+    """有积分的一组用量按现行口径计费:¥ = 积分 × _CREDIT_CNY,美元置 0。已符合口径时原样返回。"""
+    credits = values.get("credits") or 0
+    if isinstance(credits, bool) or not isinstance(credits, (int, float)) or credits <= 0:
+        return values
+    cny = float(credits) * _CREDIT_CNY
+    if not (values.get("cost") or 0) and math.isclose(
+            values.get("cost_cny") or 0, cny, rel_tol=1e-9, abs_tol=1e-9):
+        return values
+    return {**values, "cost": 0.0, "cost_cny": cny}
+
+
+def _tencent_credit_day(day):
+    """账本里旧解析器写下的腾讯系天:有积分,却按价格表记了美元、人民币为 0。
+    读取时按现行口径纠正,只改返回值,不动账本本身。
+
+    天级积分与现存日志一致，人民币以它为准。模型表里可能残留旧解析器写的条目
+    (模型名写法不同，如 claude-opus-4-7)：积分没计入天级合计，美元却计入了，
+    所以天级美元要扣掉所有带积分模型的美元。"""
+    if not isinstance(day, dict):
+        return day
+    models = day.get("models")
+    if not isinstance(models, dict) or not models:
+        return _tencent_credit_values(day)
+    fixed = {name: _tencent_credit_values(mv) if isinstance(mv, dict) else mv
+             for name, mv in models.items()}
+    changed = [name for name in models if fixed[name] is not models[name]]
+    credits = day.get("credits") or 0
+    if isinstance(credits, bool) or not isinstance(credits, (int, float)):
+        credits = 0
+    if credits > 0:
+        cny = float(credits) * _CREDIT_CNY
+    else:  # 天级没记积分才退回模型合计
+        cny = (day.get("cost_cny") or 0) + sum(
+            fixed[n]["cost_cny"] - (models[n].get("cost_cny") or 0) for n in changed)
+    if not changed and math.isclose(day.get("cost_cny") or 0, cny,
+                                    rel_tol=1e-9, abs_tol=1e-9):
+        return day
+    if sum((mv.get("cost_cny") or 0) for mv in fixed.values() if isinstance(mv, dict)) > cny + 0.005:
+        # 模型合计超出天级：多出来的是残留条目，原先没记人民币的那些只去掉美元，不分人民币
+        for n in changed:
+            if not (models[n].get("cost_cny") or 0):
+                fixed[n] = {**fixed[n], "cost_cny": 0.0}
+    out = dict(day, models=fixed, cost_cny=cny)
+    out["cost"] = max(0.0, (day.get("cost") or 0) - sum(
+        models[n].get("cost") or 0 for n in changed))
+    return out
+
+
 def _scan_workbuddy_root(bounds, cache, root, tool_key, extra_files=None, extra_parser=None):
     if tool_key in _UNPRICED_COST_TOOLS:
         _prepare_unpriced_cost_ledger(tool_key)
@@ -11650,6 +11702,7 @@ def _scan_workbuddy_root(bounds, cache, root, tool_key, extra_files=None, extra_
             day_date = date.fromisoformat(day_key)
         except ValueError:
             continue
+        day = _tencent_credit_day(day)
         for range_key in classify_date(day_date, bounds):
             _merge_token_day(B[range_key], day)
     if changed:
@@ -16144,6 +16197,17 @@ def _cny_breakdown(cache, cutoff=None):
             if "cost_cny" in record:
                 days[dk] = {model: mv.get("cost_cny", 0.0)
                             for model, mv in record.get("models", {}).items()}
+    # 腾讯系的人民币来自积分账单，只出天级合计(模型行由调用方按积分折算)。账本里今天那份
+    # 可能还没落盘，逐天取实时与账本中较大的一份，与按天积分的高水位合并同口径。
+    for tool in _TENCENT_CREDIT_TOOLS:
+        live = {}
+        for _, _, record in _iter_workbuddy_records(cache.get(tool, {})):
+            live[record["date"]] = live.get(record["date"], 0.0) + (record.get("cost_cny") or 0.0)
+        for dk, record in _load_ledger().get("tools", {}).get(tool, {}).items():
+            record = _tencent_credit_day(record)
+            if isinstance(record, dict) and (record.get("cost_cny") or 0) > live.get(dk, 0.0):
+                live[dk] = record["cost_cny"]
+        by_tool[tool] = {dk: {"": amount} for dk, amount in live.items() if amount > 0}
     daily, models, daily_tools = {}, {}, {}
     for tool, days in by_tool.items():
         for dk, amounts in days.items():
@@ -16151,6 +16215,8 @@ def _cny_breakdown(cache, cutoff=None):
                 continue
             daily[dk] = daily.get(dk, 0.0) + sum(amounts.values())
             daily_tools.setdefault(dk, {})[tool] = sum(amounts.values())
+            if tool in _TENCENT_CREDIT_TOOLS:
+                continue
             for model, amount in amounts.items():
                 key = (tool, nice_model(model))
                 models[key] = models.get(key, 0.0) + amount
@@ -16566,6 +16632,8 @@ def build_daily_costs(period="all", refresh=True, _cache=None):
                 continue
             if cutoff and dk < cutoff:
                 continue
+            if tool in _TENCENT_CREDIT_TOOLS:
+                day = _tencent_credit_day(day)
             ledger_tok = _ledger_token_sum(day, tool)
             cost = day.get("cost")
             ledger_cost = (float(cost) if isinstance(cost, (int, float))
@@ -16720,7 +16788,11 @@ def build_daily_costs(period="all", refresh=True, _cache=None):
         day["cny_by_tool"] = cny_tools.get(day["date"], {})
     for model in model_list:
         base_name = model["name"].rsplit(" (", 1)[0]
-        model["cost_cny"] = cny_models.get((model["tool"], base_name), 0.0)
+        if model["tool"] in _TENCENT_CREDIT_TOOLS:
+            # 模型行的积分只来自现存日志，人民币按同一份积分折算，两列才对得上
+            model["cost_cny"] = round(model.get("credits", 0) * _CREDIT_CNY, 3)
+        else:
+            model["cost_cny"] = cny_models.get((model["tool"], base_name), 0.0)
     return {"daily": daily, "models": model_list, "provider_models": provider_model_list}
 
 
@@ -17134,6 +17206,8 @@ def build_wrapped(period="all", refresh=True, _cache=None):
                 continue
             if cutoff and dk < cutoff:
                 continue
+            if tool in _TENCENT_CREDIT_TOOLS:
+                day = _tencent_credit_day(day)
             tok = _ledger_token_sum(day, tool)
             if tok:
                 ledger_day_tokens[dk] = ledger_day_tokens.get(dk, 0) + tok

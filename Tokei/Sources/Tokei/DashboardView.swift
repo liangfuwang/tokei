@@ -149,10 +149,12 @@ struct HeatDetailCard: View {
                              tokens: day.pa_in + day.pa_out + day.pa_cr + day.pa_cw + day.pa_reason,
                              cost: day.prime_agent ?? 0)
                 HeatToolCell(name: "WorkBuddy", tint: Theme.workbuddy,
-                             tokens: wTokens, cost: day.workbuddy ?? 0)
+                             tokens: wTokens, cost: day.workbuddy ?? 0,
+                             cny: day.cny_by_tool?["workbuddy"])
                 if waTokens > 0 {
                     HeatToolCell(name: "WorkBuddy Intl.", tint: Theme.workbuddyAI,
-                                 tokens: waTokens, cost: day.workbuddy_ai ?? 0)
+                                 tokens: waTokens, cost: day.workbuddy_ai ?? 0,
+                                 cny: day.cny_by_tool?["workbuddy_ai"])
                 }
                 if dTokens > 0 {
                     HeatToolCell(name: "DeepSeek Harness", tint: Theme.deepseekHarness,
@@ -833,7 +835,9 @@ struct DashboardView: View {
         var data = fallback ?? WrappedData()
         data.total_tokens = totalTokens
         data.total_cost = totalCost
-        data.cost_cny = (usage.deepseekHarness.ranges.get(key).cost_cny ?? 0) + (usage.opencode.ranges.get(key).cost_cny ?? 0)
+        data.cost_cny = [usage.deepseekHarness, usage.opencode,
+                         usage.workbuddy, usage.workbuddyAI, usage.codebuddy]
+            .reduce(0) { $0 + ($1.ranges.get(key).cost_cny ?? 0) }
         data.top_model = WrappedModel(name: top?.name ?? "-", tokens: top?.tokens ?? 0)
         data.period = period.rawValue
         if data.first_day.isEmpty {

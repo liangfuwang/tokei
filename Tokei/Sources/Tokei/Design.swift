@@ -224,7 +224,9 @@ struct StatBar: View {
                 Spacer(minLength: 8)
                 Text(Fmt.human(tokens)).font(.system(size: Theme.fontSize(9.5), design: .monospaced))
                     .foregroundStyle(Theme.tTertiary)
-                Text(nativeMoney(cost, cost_cny)).font(.system(size: Theme.fontSize(10), weight: .semibold, design: .monospaced))
+                // 有用量却没价钱(没有公开价、或旧日志没记积分)：$0.00 看着像免费
+                Text(tokens > 0 && cost == 0 && (cost_cny ?? 0) == 0 ? L("未计费") : nativeMoney(cost, cost_cny))
+                    .font(.system(size: Theme.fontSize(10), weight: .semibold, design: .monospaced))
                     .foregroundStyle(Theme.tSecondary)
             }
             GeometryReader { geo in
