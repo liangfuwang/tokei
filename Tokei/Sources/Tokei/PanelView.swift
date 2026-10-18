@@ -98,6 +98,8 @@ struct PanelView: View {
     @AppStorage("qwenWorkQuotaEnabled") private var qwenWorkQuotaEnabled = false
     /// 默认关闭：仅在 Desktop 缓存不可用时复用 Claude Code CLI 登录态查询官方额度。
     @AppStorage("claudeCLIQuotaEnabled") private var claudeCLIQuotaEnabled = false
+    @AppStorage(ClaudeAccountDisplayNames.defaultsKey) private var claudeAccountDisplayNames = "{}"
+    @State private var localClaudeAccountIDs = ["claude"]
     @AppStorage(ActivityReporter.enabledKey) private var activityStatisticsEnabled = true
     /// 菜单栏额度来源（与显示卡片独立），每项是一个具体窗口。
     /// 只有历史上就默认开的 Claude 5h 与 Codex 周保持默认开，其余窗口默认关，避免抢占状态栏。
@@ -437,11 +439,11 @@ struct PanelView: View {
         let mcr = u.musecode.ranges.get(sel), ccr = u.cmdcode.ranges.get(sel)
         let dvr = u.devin.ranges.get(sel), mmr = u.minimax.ranges.get(sel)
         let items: [ToolCardItem] = [
-            ToolCardItem(id: "claude", name: "Claude", visible: showClaude,
+            ToolCardItem(id: "claude", name: ClaudeAccountDisplayNames.title(for: "claude", in: claudeAccountDisplayNames), visible: showClaude,
                          active: cr.sessions > 0 || claudeMain.q5 != nil ||
                              claudeMain.q7 != nil || claudeMain.qf != nil,
                          tint: Theme.claude,
-                         content: AnyView(claudeBlock(claudeMain, cr))),
+                         content: AnyView(claudeBlock(claudeMain, cr, title: ClaudeAccountDisplayNames.title(for: "claude", in: claudeAccountDisplayNames)))),
             ToolCardItem(id: "codex", name: "Codex", visible: showCodex,
                          active: xr.sessions > 0 || u.codex.p5 != nil || u.codex.pw != nil ||
                              (u.codex.reset_cards?.count ?? 0) > 0,
@@ -578,7 +580,7 @@ struct PanelView: View {
         let accountCards: [ToolCardItem] = u.claude.accountNames.map { name in
             let stat = u.claude.account(name)
             let range = stat.ranges.get(sel)
-            let title = "Claude Code · \(name)"
+            let title = ClaudeAccountDisplayNames.title(for: "claude-\(name)", in: claudeAccountDisplayNames)
             return ToolCardItem(
                 id: "claude-\(name)", name: title, visible: showClaude,
                 active: range.sessions > 0 || range.tokens > 0 ||
@@ -628,7 +630,7 @@ struct PanelView: View {
             (value: c.qf, stale: c.qf_stale),
         ])
         VStack(alignment: .leading, spacing: 11) {
-            cardHead(title, tint: Theme.claude, sessions: r.sessions, toolID: toolID)
+            cardHead(title, tint: Theme.claude, sessions: r.sessions, toolID: toolID, fitTitle: true)
             if r.sessions > 0 {
                 CostHeadline(value: Fmt.human(r.in + r.out + r.cr + r.cw), caption: L("%@ 总量", sel.label), tint: Theme.claude)
                 metricGrid([
@@ -2142,11 +2144,13 @@ struct PanelView: View {
         return denom > 0 ? Double(m.cr) / Double(denom) * 100 : 0
     }
 
-    func cardHead(_ title: String, tint: Color, sessions: Int = 0, toolID: String? = nil) -> some View {
+    func cardHead(_ title: String, tint: Color, sessions: Int = 0, toolID: String? = nil, fitTitle: Bool = false) -> some View {
         HStack(spacing: 7) {
             Circle().fill(tint.gradient).frame(width: 8, height: 8)
                 .shadow(color: tint.opacity(0.6), radius: 3)
             Text(title).font(.system(size: Theme.fontSize(14), weight: .bold))
+                .lineLimit(fitTitle ? 1 : nil)
+                .minimumScaleFactor(fitTitle ? 0.7 : 1)
             if sessions > 0 {
                 Text("\(sessions)")
                     .font(.system(size: Theme.fontSize(10), weight: .bold, design: .rounded))
@@ -2819,6 +2823,7 @@ struct PanelView: View {
             HStack(alignment: .top, spacing: 11) {
                 VStack(alignment: .leading, spacing: 11) {
                     settingsAgentsSection
+                    settingsClaudeAccountNamesSection
                     settingsProviderQuotaSection
                     settingsDiagnosticsSection
                     settingsPricingSection
@@ -2841,6 +2846,7 @@ struct PanelView: View {
         }
         .onAppear {
             loginItem.refresh()
+            localClaudeAccountIDs = ClaudeAccountDisplayNames.localAccountIDs()
             loadProviderSettings()
             if let cfg = SyncManager.loadConfig() {
                 if let persistedID = Self.validSyncDeviceID(cfg.device_id) {
@@ -3107,6 +3113,37 @@ struct PanelView: View {
                 Text(error)
                     .font(.system(size: Theme.fontSize(8.5)))
                     .foregroundStyle(.red.opacity(0.85))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var claudeAccountIDs: [String] {
+        let observed = (store.usage?.claude.accountNames ?? []).map { "claude-" + $0 }
+        let extras = Set(localClaudeAccountIDs + observed).subtracting(["claude"]).sorted()
+        return ["claude"] + extras
+    }
+
+    var settingsClaudeAccountNamesSection: some View {
+        settingsSection("person.crop.rectangle", L("Claude 账号显示名")) {
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(claudeAccountIDs, id: \.self) { accountID in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(accountID == "claude" ? "~/.claude" : "~/.claude-" + accountID.dropFirst("claude-".count))
+                            .font(.system(size: Theme.fontSize(8.5), design: .monospaced))
+                            .foregroundStyle(Theme.tTertiary)
+                        TextField(accountID == "claude" ? L("默认账号") : String(accountID.dropFirst("claude-".count)), text: Binding(
+                            get: { ClaudeAccountDisplayNames.names(in: claudeAccountDisplayNames)[accountID] ?? "" },
+                            set: { claudeAccountDisplayNames = ClaudeAccountDisplayNames.updating(claudeAccountDisplayNames, accountID: accountID, name: $0) }
+                        ))
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: Theme.fontSize(10)))
+                        .accessibilityLabel(L("Claude 账号显示名") + " " + accountID)
+                    }
+                }
+                Text(L("留空使用原名称；仅修改本机显示名，不影响用量和账号登录。"))
+                    .font(.system(size: Theme.fontSize(8.5)))
+                    .foregroundStyle(Theme.tTertiary)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }

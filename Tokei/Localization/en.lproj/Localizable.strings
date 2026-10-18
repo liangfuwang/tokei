@@ -601,3 +601,8 @@
 "平均输出速度（含等待）" = "Avg output speed (incl. wait)";
 "平均速度（含等待）" = "Avg speed (incl. wait)";
 "输出 token 总数 ÷ 记录耗时；%@ 个请求中，%@ 个包含首字等待，无法还原纯生成速度" = "Total output tokens ÷ recorded duration; of %@ requests, %@ include first-token wait, so pure generation speed is unavailable";
+
+// Claude account display names
+"Claude 账号显示名" = "Claude account display names";
+"默认账号" = "Default account";
+"留空使用原名称；仅修改本机显示名，不影响用量和账号登录。" = "Leave blank to use the original name. Changes only this Mac’s display names, not usage or account sign-in.";

@@ -221,6 +221,7 @@ class SwiftCustomizationTests(SourceGuard):
             binary = Path(tmp) / "local-customizations-check"
             build = subprocess.run(
                 ["swiftc", "-parse-as-library", str(SRC / "Model.swift"), str(SRC / "L10n.swift"),
+                 str(SRC / "ClaudeAccountDisplayNames.swift"),
                  str(ROOT / "tests/swift/LocalCustomizationsCheck.swift"), "-o", str(binary)],
                 capture_output=True, text=True, cwd=ROOT)
             self.assertEqual(build.returncode, 0, build.stderr)
@@ -231,7 +232,9 @@ class SwiftCustomizationTests(SourceGuard):
     # 以下为源码级守护：界面层不单独编译运行，只确认定制代码还在。
     def test_extra_claude_accounts_get_their_own_cards(self):
         self.assertInSource("u.claude.primaryAccount", "PanelView.swift")
-        self.assertInSource('"Claude Code · \\(name)"', "PanelView.swift")
+        self.assertInSource('ClaudeAccountDisplayNames.title(for: "claude-\\(name)"', "PanelView.swift")
+        self.assertInSource("settingsClaudeAccountNamesSection", "PanelView.swift")
+        self.assertInSource("@AppStorage(ClaudeAccountDisplayNames.defaultsKey)", "PanelView.swift")
 
     def test_cards_are_sorted_by_usage_including_extra_accounts(self):
         # 上游 v1.0.47 起自带按用量排序；本 fork 让它认得额外账号卡，默认账号卡只按默认账号的量排
