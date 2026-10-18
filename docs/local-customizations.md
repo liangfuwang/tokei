@@ -18,6 +18,11 @@
 
 本地版（`TokeiLocalBuild=true`）的「检查更新」查到上游新版时只提示，不会下载安装官方包，因为官方包不含这些定制。
 
+全套测试只有正常完成后才比较失败用例；导入崩溃、进程中断、零用例或缺少基线时的失败都会阻止验证通过。
+Swift 原生行为测试仅在 macOS 运行，Python 与源码守护仍在 Windows/Linux 运行。
+若本机 Command Line Tools 缺少 SwiftUI 宏插件，可与打包脚本一样使用兼容 SDK：
+`SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.sdk python3 -m unittest discover -s tests`（需已安装该 SDK）。
+
 ## 定制清单
 
 | 定制 | 位置 | 合并时注意 |
@@ -32,3 +37,9 @@
 | Claude 账号显示名：设置里按配置目录自定义，默认账号和额外账号均支持，留空保留原名称；只存本机偏好，不同步、不写账号目录 | `ClaudeAccountDisplayNames.swift`、`PanelView.swift` 的 `settingsClaudeAccountNamesSection` 与卡片标题；偏好键 `claudeAccountDisplayNames` | 保留卡片 ID 和原始账号名，不能用显示名参与用量归属或额度匹配；个人显示名不能硬编码进仓库 |
 | 仪表盘：腾讯系人民币；有用量无价钱时显示「未计费」 | `DashboardView.swift`、`Design.swift` 的 `StatBar` | |
 | 本地版不安装官方包 | `Updater.swift`：`localBuildUpdateAvailable` | |
+
+## 历史账本限制
+
+旧版 WorkBuddy 账本可能残留同一模型的不同名称条目，使模型明细积分合计高于卡片总积分。
+当前人民币总额以天级积分为准，模型人民币明细已避免重复分配；模型积分残留尚未清理。
+处理这类历史数据前需核对原始记录，不能直接按名称相似或积分大小删除账本条目。

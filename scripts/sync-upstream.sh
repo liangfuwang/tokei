@@ -41,6 +41,20 @@ failures() {  # 从 unittest 输出里取失败用例名
     grep -E '^(FAIL|ERROR): ' "$1" | sort -u || true
 }
 
+run_full_suite() {
+    local directory="$1" output="$2" status=0
+    ( cd "$directory" && python3 -m unittest discover -s tests >"$output" 2>&1 ) || status=$?
+    # 比较失败名称前，先确认测试真正跑完，避免把导入失败、崩溃或被终止误判为通过。
+    if ! grep -Eq '^Ran [1-9][0-9]* tests? in ' "$output" \
+        || ! grep -Eq '^(OK($| \()|FAILED \()' "$output" \
+        || [ "$status" -gt 1 ] \
+        || { [ "$status" -ne 0 ] && [ -z "$(failures "$output")" ]; }; then
+        echo "全套测试未正常完成（退出码 ${status}）：$output" >&2
+        tail -10 "$output" >&2
+        return 1
+    fi
+}
+
 run_tests() {
     log "定制守护测试（必须全过）"
     if ! python3 -m unittest discover -s tests -p 'test_local_customizations.py'; then
@@ -58,9 +72,15 @@ run_tests() {
     if [ -n "$base" ]; then
         git worktree add --quiet --detach "$base_wt" "$base"
         # 先后跑，不能并行：两套测试同时跑会争用共享的临时状态，出现假失败
-        ( cd "$base_wt" && python3 -m unittest discover -s tests >"$base_log" 2>&1 || true )
+        if ! run_full_suite "$base_wt" "$base_log"; then
+            git worktree remove --force "$base_wt"
+            exit 4
+        fi
     fi
-    python3 -m unittest discover -s tests >"$new_log" 2>&1 || true
+    if ! run_full_suite "$ROOT" "$new_log"; then
+        [ -z "$base" ] || git worktree remove --force "$base_wt"
+        exit 4
+    fi
     tail -3 "$new_log"
     if [ -n "$base" ]; then
         local added
@@ -73,7 +93,11 @@ run_tests() {
         fi
         echo "没有新增失败（合并前就失败的用例：$(failures "$base_log" | wc -l | tr -d ' ') 个）。"
     else
-        failures "$new_log"
+        if [ -n "$(failures "$new_log")" ]; then
+            failures "$new_log"
+            echo "没有可用基线，全套测试必须通过：$new_log" >&2
+            exit 4
+        fi
     fi
 }
 

@@ -9,6 +9,7 @@
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -215,6 +216,7 @@ class ClaudeExtraAccountTests(unittest.TestCase):
 
 
 class SwiftCustomizationTests(SourceGuard):
+    @unittest.skipUnless(sys.platform == "darwin", "Native Swift app tests require macOS")
     def test_account_split_adds_up_to_total(self):
         """默认账号 + 额外账号 必须恒等于总量（Model.swift 的 primaryAccount / account）。"""
         with tempfile.TemporaryDirectory() as tmp:
