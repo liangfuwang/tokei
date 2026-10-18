@@ -233,9 +233,11 @@ class SwiftCustomizationTests(SourceGuard):
         self.assertInSource("u.claude.primaryAccount", "PanelView.swift")
         self.assertInSource('"Claude Code · \\(name)"', "PanelView.swift")
 
-    def test_cards_are_sorted_by_usage(self):
-        panel = source("PanelView.swift")
-        self.assertTrue("sortedByUsage" in panel or "UsageCardOrdering.sorted" in panel, "卡片不再按用量排序")
+    def test_cards_are_sorted_by_usage_including_extra_accounts(self):
+        # 上游 v1.0.47 起自带按用量排序；本 fork 让它认得额外账号卡，默认账号卡只按默认账号的量排
+        self.assertInSource("UsageCardOrdering.sorted", "PanelView.swift")
+        self.assertInSource('id.hasPrefix("claude-")', "UsageCardOrdering.swift")
+        self.assertInSource('case "claude": return u.claude.primaryAccount', "UsageCardOrdering.swift")
 
     def test_extra_account_quota_is_read_only_from_its_own_keychain_item(self):
         self.assertInSource("func fetchExtraAccountQuotas", "ClaudeCLIQuotaBridge.swift")

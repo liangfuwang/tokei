@@ -28,6 +28,6 @@
 | WorkBuddy：rawUsage 优先于陈旧的 message.usage；缓存写多套键取最大；模型名 `claude-opus-4-7` 统一成 `4.7` | `usage.30s.py`：`_workbuddy_usage_record`、`_workbuddy_max_number`、`_normalize_agent_model` | 改解析逻辑要调高 `_WORKBUDDY_PARSER_VERSION` |
 | DeepSeek Harness 同时读 CLI（`~/.dsh`）和桌面版会话 | `DataLoader.swift` 的 DSH 解压部分 | |
 | 多个 Claude Code 账号（`~/.claude-<name>`）：按各账号 history.jsonl 归属用量；额外账号的额度只读它自己的钥匙串条目；额外账号单独成卡 | `usage.30s.py`：`_claude_*`、`claude.account_usage`；`ClaudeCLIQuotaBridge.swift`、`DataLoader.swift`、`Model.swift`（`primaryAccount` / `account(_:)`）、`PanelView.swift` | 默认账号 + 额外账号必须恒等于总量；对账号目录和钥匙串只读 |
-| 首页卡片按当前范围 token 用量从大到小排序（只排序，不改卡片大小） | `PanelView.swift` | 上游 v1.0.47 起自带排序，额外账号卡要接进上游的排序 |
+| 首页卡片按当前范围 token 用量从大到小排序（只排序，不改卡片大小），额外账号卡也参与排序 | 上游 v1.0.47 起自带排序；本 fork 只改 `UsageCardOrdering.swift` 的 `tokens(for:)`：认得 `claude-<name>`，默认账号卡按 `primaryAccount` 排 | 上游改这个函数时保住这两处 |
 | 仪表盘：腾讯系人民币；有用量无价钱时显示「未计费」 | `DashboardView.swift`、`Design.swift` 的 `StatBar` | |
 | 本地版不安装官方包 | `Updater.swift`：`localBuildUpdateAvailable` | |
