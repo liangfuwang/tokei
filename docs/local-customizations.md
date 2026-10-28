@@ -33,6 +33,7 @@ Swift 原生行为测试仅在 macOS 运行，Python 与源码守护仍在 Windo
 | WorkBuddy：rawUsage 优先于陈旧的 message.usage；缓存写多套键取最大；模型名 `claude-opus-4-7` 统一成 `4.7` | `usage.30s.py`：`_workbuddy_usage_record`、`_workbuddy_max_number`、`_normalize_agent_model` | 改解析逻辑要调高 `_WORKBUDDY_PARSER_VERSION` |
 | DeepSeek Harness 同时读 CLI（`~/.dsh`）和桌面版会话 | `DataLoader.swift` 的 DSH 解压部分 | |
 | 多个 Claude Code 账号（`~/.claude-<name>`）：按各账号 history.jsonl 归属用量；额外账号的额度只读它自己的钥匙串条目；额外账号单独成卡 | `usage.30s.py`：`_claude_*`、`claude.account_usage`；`ClaudeCLIQuotaBridge.swift`、`DataLoader.swift`、`Model.swift`（`primaryAccount` / `account(_:)`）、`PanelView.swift` | 默认账号 + 额外账号必须恒等于总量；对账号目录和钥匙串只读 |
+| Claude 多账号卡不显示工具汇总的「本周期已花」；单账号保留上游周期费用行，额度曲线页仍可查看工具汇总 | `PanelView.swift` 的 `claudeBlock(showCycleSpend:)` | 上游周期费用尚未按账号拆分，不能把所有账号合计冒充单个账号账单 |
 | 首页卡片按当前范围 token 用量从大到小排序（只排序，不改卡片大小），额外账号卡也参与排序 | 上游 v1.0.47 起自带排序；本 fork 只改 `UsageCardOrdering.swift` 的 `tokens(for:)`：认得 `claude-<name>`，默认账号卡按 `primaryAccount` 排 | 上游改这个函数时保住这两处 |
 | Claude 账号显示名：设置里按配置目录自定义，默认账号和额外账号均支持，留空保留原名称；只存本机偏好，不同步、不写账号目录 | `ClaudeAccountDisplayNames.swift`、`PanelView.swift` 的 `settingsClaudeAccountNamesSection` 与卡片标题；偏好键 `claudeAccountDisplayNames` | 保留卡片 ID 和原始账号名，不能用显示名参与用量归属或额度匹配；个人显示名不能硬编码进仓库 |
 | 仪表盘：腾讯系人民币；有用量无价钱时显示「未计费」 | `DashboardView.swift`、`Design.swift` 的 `StatBar` | |

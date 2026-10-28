@@ -3,6 +3,7 @@
 // Grok Bot 的官方额度授权在 Mac 上靠钥匙串原生助手（重新授权提示 grokBotReauthorizePrompt），
 // Windows 使用 DPAPI 集成脚本；授权入口在设置页，JSON 里的额度和用量照常画。
 import * as Fmt from "../lib/fmt";
+import { CycleSpendRow } from "./CycleSpendRow";
 import { L } from "../lib/i18n";
 import { rangeLabel } from "../lib/store";
 import { getRange, totalTokens, type PerfStat, type RangeKey, type Ranges, type TokenModelStat, type TokenUsageRange, type Usage } from "../lib/types";
@@ -294,6 +295,7 @@ function GrokCard({ ctx }: { ctx: CardContext }) {
             tint={Theme.grok}
             stale={g.stale === true}
           />
+          <CycleSpendRow payload={ctx.quotaDetail} tool="grok" reset={g.reset} />
           {products.map((product) => (
             <GrokProductShareRow
               key={product.name}
@@ -376,7 +378,7 @@ function activity(raw: GrokBotActivityRange) {
 
 type GrokBotActivity = ReturnType<typeof activity>;
 
-interface GrokBotDisplay {
+export interface GrokBotDisplay {
   key: RangeKey;
   range: GrokBotActivity;
   usage: TokenUsageRange;
@@ -387,7 +389,7 @@ const grokBotStat = (usage: Usage): GrokBotStat => (usage.grok_bot as GrokBotSta
 const FALLBACK_ORDER: RangeKey[] = ["today", "yesterday", "week", "last_week", "month", "year", "all"];
 
 /** 选中的区间没有活动也没有用量时，改显示最近一个有数据的区间（toolCards 里的 grokBotDisplay）。 */
-function grokBotDisplay(usage: Usage, sel: RangeKey): GrokBotDisplay {
+export function grokBotDisplay(usage: Usage, sel: RangeKey): GrokBotDisplay {
   const stat = grokBotStat(usage);
   const at = (key: RangeKey): GrokBotDisplay => ({
     key,
@@ -458,10 +460,16 @@ function GrokBotCard({ ctx }: { ctx: CardContext }) {
 
 export const grokBotCard: CardSpec = {
   id: "grok-bot",
-  // 只有当前页签真有本地活动时才能复制（Mac：hasActivity && displayedRange == sel）。
+  // 本地活动或账号用量存在时即可复制分享图。
   copyable: ({ usage, range }) => {
     const d = grokBotDisplay(usage, range);
-    return d.key === range && (d.range.sessions > 0 || d.range.calls > 0 || d.range.turns > 0);
+    return (
+      d.range.sessions > 0 ||
+      d.range.calls > 0 ||
+      d.range.turns > 0 ||
+      totalTokens(d.usage) > 0 ||
+      (d.usage.requests ?? 0) > 0
+    );
   },
   name: "Grok Bot",
   visibleKey: "showGrokBot",

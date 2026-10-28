@@ -244,6 +244,11 @@ class SwiftCustomizationTests(SourceGuard):
         self.assertInSource('id.hasPrefix("claude-")', "UsageCardOrdering.swift")
         self.assertInSource('case "claude": return u.claude.primaryAccount', "UsageCardOrdering.swift")
 
+    def test_combined_cycle_spend_is_not_shown_as_one_accounts_bill(self):
+        self.assertInSource("showCycleSpend: u.claude.accountNames.isEmpty", "PanelView.swift")
+        self.assertInSource("toolID: nil, showCycleSpend: false", "PanelView.swift")
+        self.assertInSource('if showCycleSpend {\n                        cycleSpendRow("claude"', "PanelView.swift")
+
     def test_extra_account_quota_is_read_only_from_its_own_keychain_item(self):
         self.assertInSource("func fetchExtraAccountQuotas", "ClaudeCLIQuotaBridge.swift")
         self.assertInSource('"\\(defaultKeychainService)-\\(hash)"', "ClaudeCLIQuotaBridge.swift")

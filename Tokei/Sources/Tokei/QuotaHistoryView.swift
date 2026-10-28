@@ -44,6 +44,7 @@ private struct QuotaHistoryFrame {
     var now: Date
     var start: Date
     var projection: QuotaHistoryProjection
+    var latestRecovery: QuotaChangeEvent?
     /// 每天用了多少额度。取本机留着的全部快照（最多 7 天），不跟着上面的跨度走，
     /// 否则选 24h 时只剩今天和半个昨天。
     var daily: [QuotaDailyConsumption]
@@ -101,6 +102,9 @@ struct QuotaHistoryView: View {
         Card(tint: tool.tint) {
             VStack(alignment: .leading, spacing: 12) {
                 summary(frame.projection)
+                if let recovery = frame.latestRecovery {
+                    recoveryNotice(recovery, start: frame.start)
+                }
                 if frame.projection.lineData.isEmpty {
                     emptyState
                 } else {
@@ -111,6 +115,30 @@ struct QuotaHistoryView: View {
         dailyConsumptionSection(frame.daily)
         changesSection(frame.projection)
         activitySection(frame.projection)
+    }
+
+    private func recoveryNotice(_ event: QuotaChangeEvent, start: Date) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "arrow.up.circle.fill")
+                .foregroundStyle(seriesColor(for: event.window))
+            VStack(alignment: .leading, spacing: 3) {
+                Text(event.isFullRecovery ? L("最近回满") : L("最近回升"))
+                    .font(.system(size: Theme.fontSize(10.5), weight: .semibold))
+                    .foregroundStyle(Theme.tPrimary)
+                Text("\(Self.eventTimeFormatter.string(from: event.timestamp)) · \(L(event.window)) · \(String(format: "%.0f%% → %.0f%%", event.previousRemaining, event.remaining))")
+                    .font(.system(size: Theme.fontSize(9.5), design: .monospaced))
+                    .foregroundStyle(Theme.tSecondary)
+            }
+            Spacer(minLength: 4)
+            if event.timestamp < start {
+                Button(L("查看曲线")) { span = .week }
+                    .font(.system(size: Theme.fontSize(10), weight: .semibold))
+                    .buttonStyle(.plain)
+                    .foregroundStyle(tool.tint)
+            }
+        }
+        .padding(10)
+        .background(tool.tint.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
     }
 
     /// 每天用掉了周额度的多少个百分点（issue #85）。Codex 看周额度，Claude 看周 · 全部。
@@ -169,13 +197,13 @@ struct QuotaHistoryView: View {
             .fixedSize(horizontal: false, vertical: true)
     }
 
-    // MARK: - 周额度消耗
+    // MARK: - 额度周期消耗
 
     private var cycleSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             cycleHeader
             if detail.payload == nil {
-                Card(tint: Theme.codex) { cyclePlaceholder(L("正在读取周额度…")) }
+                Card(tint: Theme.codex) { cyclePlaceholder(L("正在读取额度周期…")) }
             } else if visibleCycleTools.isEmpty {
                 Card(tint: Theme.codex) {
                     cyclePlaceholder(L("所有订阅的额度重置时间都拿不到，定位不了周期"))
@@ -199,7 +227,7 @@ struct QuotaHistoryView: View {
     private var cycleHeader: some View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
             VStack(alignment: .leading, spacing: 2) {
-                Text(L("一个周额度用了多少"))
+                Text(L("一个额度周期用了多少"))
                     .font(.system(size: Theme.fontSize(14), weight: .bold))
                     .foregroundStyle(Theme.tPrimary)
                 Text(cycleSubtitle)
@@ -266,7 +294,7 @@ struct QuotaHistoryView: View {
             return L("Claude Code 还没有周额度卡片：可打开 Claude Desktop 的 Usage 页面，")
                 + L("或在设置的「隐私与额度」开启 Claude Code CLI 额度查询。")
         case "grok":
-            return L("Grok 还没有周额度卡片：登录一次 grok.com 让 Tokei 抓到额度读数。")
+            return L("Grok 还没有额度卡片：登录一次 grok.com 让 Tokei 抓到额度读数。")
         default:
             return L("Codex 还没有周额度卡片：跑一次 codex 让它刷新额度读数。")
         }
@@ -275,7 +303,8 @@ struct QuotaHistoryView: View {
     private func cycleCard(_ cycle: QuotaCycle) -> some View {
         VStack(alignment: .leading, spacing: 9) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text(L("%@ 周额度", cycleName(cycle.tool)))
+                Text(cycle.isMonthly ? L("%@ 月额度", cycleName(cycle.tool))
+                     : L("%@ 周额度", cycleName(cycle.tool)))
                     .font(.system(size: Theme.fontSize(12), weight: .bold))
                     .foregroundStyle(cycleTint(cycle.tool))
                 Spacer()
@@ -301,9 +330,17 @@ struct QuotaHistoryView: View {
                             .font(.system(size: Theme.fontSize(10)))
                             .foregroundStyle(Theme.tTertiary)
                     }
-                    Text(Fmt.grouped(cycle.tokens))
-                        .font(.system(size: Theme.fontSize(9.5), design: .monospaced))
-                        .foregroundStyle(Theme.tTertiary)
+                    HStack(spacing: 6) {
+                        if let cost = cycle.costLabel {
+                            Text("≈ \(cost)")
+                                .font(.system(size: Theme.fontSize(11), weight: .semibold, design: .monospaced))
+                                .foregroundStyle(Theme.tSecondary)
+                                .help(L("按 API 价估算；缺少完整明细时，周期首尾按 token 占比分摊"))
+                        }
+                        Text(Fmt.grouped(cycle.tokens))
+                            .font(.system(size: Theme.fontSize(9.5), design: .monospaced))
+                            .foregroundStyle(Theme.tTertiary)
+                    }
                 }
                 Spacer()
                 if let projected = cycle.projectedTotal {
@@ -316,6 +353,11 @@ struct QuotaHistoryView: View {
                             .foregroundStyle(Theme.tSecondary)
                             .lineLimit(1)
                             .minimumScaleFactor(0.6)
+                        if let projectedCost = cycle.projectedCost {
+                            Text(String(format: "≈ $%.0f", projectedCost))
+                                .font(.system(size: Theme.fontSize(10), design: .monospaced))
+                                .foregroundStyle(Theme.tTertiary)
+                        }
                     }
                 }
             }
@@ -359,7 +401,7 @@ struct QuotaHistoryView: View {
         compactTitle: Bool
     ) -> some View {
         let peak = max(cycles.map(\.tokens).max() ?? 1, 1)
-        let uneven = cycles.contains { $0.durationDays < 6.5 }
+        let uneven = cycles.contains { !$0.isMonthly && $0.durationDays < 6.5 }
         let expanded = expandedCycleHistory.contains(tool)
         let visibleCycles = expanded
             ? cycles
@@ -398,6 +440,13 @@ struct QuotaHistoryView: View {
                         .font(.system(size: Theme.fontSize(11), weight: .semibold, design: .rounded))
                         .foregroundStyle(Theme.tSecondary)
                         .frame(width: 52, alignment: .trailing)
+                    Text(cycle.costLabel.map { "≈ \($0)" } ?? "—")
+                        .font(.system(size: Theme.fontSize(9.5), design: .monospaced))
+                        .foregroundStyle(Theme.tTertiary)
+                        .lineLimit(1)
+                        .frame(width: 66, alignment: .trailing)
+                        .minimumScaleFactor(0.7)
+                        .help(cycle.costLabel.map { L("这个周期约花了 %@", $0) } ?? "")
                     // 按最宽的「用到100%」留列宽：译文（使用率 100%）更长，写死 52 会截成「…」
                     ZStack(alignment: .trailing) {
                         Text(L("用到%@%%", "100")).hidden()
@@ -637,17 +686,18 @@ struct QuotaHistoryView: View {
             Text(L("最近额度变化"))
                 .font(.system(size: Theme.fontSize(12), weight: .bold))
                 .foregroundStyle(Theme.tPrimary)
-            if projection.dropEvents.isEmpty {
-                Text(L("当前时间范围内还没有检测到额度下降"))
+            if projection.changeEvents.isEmpty {
+                Text(L("当前时间范围内还没有检测到明显额度变化"))
                     .font(.system(size: Theme.fontSize(10)))
                     .foregroundStyle(Theme.tTertiary)
             } else {
-                ForEach(Array(projection.dropEvents.prefix(8))) { event in
+                ForEach(Array(projection.changeEvents.prefix(8))) { event in
                     HStack(spacing: 8) {
-                        Text(Self.timeFormatter.string(from: event.timestamp))
+                        Text((span.axisShowsDate ? Self.eventTimeFormatter : Self.timeFormatter)
+                            .string(from: event.timestamp))
                             .font(.system(size: Theme.fontSize(9.5), design: .monospaced))
                             .foregroundStyle(Theme.tTertiary)
-                            .frame(width: 40, alignment: .leading)
+                            .frame(width: span.axisShowsDate ? 78 : 40, alignment: .leading)
                         // 列宽按这个工具最长的窗口名来定：中文 42 点够用，
                         // 译文（Semaine · Fable）会折成两行，各行也要对齐。
                         ZStack(alignment: .leading) {
@@ -659,11 +709,13 @@ struct QuotaHistoryView: View {
                         .lineLimit(1)
                         .fixedSize()
                         .frame(minWidth: 42, alignment: .leading)
-                        Text(String(format: "-%.1f%%", event.drop))
+                        Text(String(format: "%+.1f%%", event.change))
                             .font(.system(size: Theme.fontSize(10.5), weight: .semibold, design: .monospaced))
-                            .foregroundStyle(Theme.tPrimary)
-                            .frame(width: 54, alignment: .trailing)
-                        Text(L("%@ 分钟", event.durationMinutes))
+                            .foregroundStyle(event.isRecovery ? seriesColor(for: event.window) : Theme.tPrimary)
+                            .frame(width: 62, alignment: .trailing)
+                        Text(event.isRecovery
+                             ? (event.isFullRecovery ? L("回满") : L("回升"))
+                             : L("%@ 分钟", event.durationMinutes))
                             .font(.system(size: Theme.fontSize(9.5)))
                             .foregroundStyle(Theme.tTertiary)
                         activityText(event.activity)
@@ -717,6 +769,7 @@ struct QuotaHistoryView: View {
                 points: history.points(since: start),
                 tool: tool
             ),
+            latestRecovery: QuotaHistoryProjection.latestRecovery(from: history.points, tool: tool),
             daily: QuotaHistoryProjection.dailyConsumption(from: history.points, tool: tool)
         )
     }
@@ -749,6 +802,12 @@ struct QuotaHistoryView: View {
     private static let dayFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateFormat = "MM-dd"
+        return formatter
+    }()
+
+    private static let eventTimeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MM-dd HH:mm"
         return formatter
     }()
 
@@ -915,6 +974,7 @@ private struct QuotaHistoryChart: View {
     @State private var hover: (sample: QuotaHoverSample, x: CGFloat)?
 
     var body: some View {
+        let recoveryIDs = Set(projection.recoveryEvents.map(\.id))
         Chart {
             ForEach(projection.lineData) { item in
                 LineMark(
@@ -928,17 +988,29 @@ private struct QuotaHistoryChart: View {
             }
             ForEach(projection.markerData) { item in
                 let isLatest = projection.latestDatumIDs.contains(item.id)
+                let isRecovery = recoveryIDs.contains(item.id)
                 PointMark(
                     x: .value(L("活动时间"), item.timestamp),
                     y: .value(L("活动额度"), item.remaining)
                 )
                 .foregroundStyle(by: .value(L("额度窗口"), L(item.window)))
-                .symbolSize(isLatest ? 16 : 8)
-                .opacity(isLatest ? 1 : 0.62)
+                .symbol(isRecovery ? .diamond : .circle)
+                .symbolSize(isRecovery ? 64 : (isLatest ? 16 : 8))
+                .opacity(isRecovery || isLatest ? 1 : 0.62)
+            }
+            if let recovery = projection.recoveryEvents.first {
+                RuleMark(x: .value(L("时间"), recovery.timestamp))
+                    .foregroundStyle((colors[recovery.window] ?? Theme.codex).opacity(0.5))
+                    .lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 3]))
+                    .annotation(position: .top, alignment: .center) {
+                        Text(recovery.isFullRecovery ? L("回满") : L("回升"))
+                            .font(.system(size: Theme.fontSize(9), weight: .semibold))
+                            .foregroundStyle(colors[recovery.window] ?? Theme.codex)
+                    }
             }
         }
         .chartXScale(domain: start ... end)
-        .chartYScale(domain: 0 ... 100)
+        .chartYScale(domain: 0 ... 100, range: .plotDimension(padding: 5))
         // 图例显示译名；颜色仍按数据里的窗口标识取，两边同一个顺序对上。
         .chartForegroundStyleScale(
             domain: projection.windowNames.map { L($0) },

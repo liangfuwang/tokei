@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# TOKEI_COLLECTOR_REVISION=6
+# TOKEI_COLLECTOR_REVISION=7
 # <bitbar.title>AI Usage Bar</bitbar.title>
 # <bitbar.version>v0.1</bitbar.version>
 # <bitbar.author>local</bitbar.author>
@@ -13,9 +13,10 @@
 # 不读取或解密账号凭据 (config qwenwork_quota_enabled 或 TOKEI_QWENWORK_QUOTA=1)。
 # Cursor / Zed / Sub2API / z.ai 额度默认关闭；开启卡片后才复用本机登录态或 Keychain
 # API Key 查询对应官方/自托管接口。Antigravity 额度只探测已运行的 127.0.0.1 服务。
-# --update-prices 仍只在用户显式触发时更新价格表。
+# 价格目录与 OpenAI 官方公开价格默认在后台每天核对；不上传本地模型、日志或凭据。
 #   Claude Code: ~/.claude/projects/<proj>/<session>.jsonl  (assistant 行 message.usage,增量)
-#   Codex:       ~/.codex/{sessions,archived_sessions}/**/rollout-*.jsonl (token_count 事件,含额度)
+#   Codex:       ~/.codex/{sessions,archived_sessions}/**/rollout-*.jsonl[.zst] (token_count 事件,含额度;
+#                官方 legacy_to_paginated_v1 迁移会把旧 rollout 压缩成 .jsonl.zst)
 #   Pi:          ~/.pi/agent/sessions/**/*.jsonl + ~/.omp/agent/sessions/**/*.jsonl
 #   WorkBuddy:   ~/.workbuddy/projects/**/*.jsonl (逐次模型调用 message.usage)
 #   WorkBuddy AI:~/.workbuddy-ai/projects/**/*.jsonl (国际版,同结构独立统计)
@@ -35,6 +36,7 @@
 #                (assistant message 自带 usage + costUsd,按 message.id 去重;
 #                 inputTokens 含 cached,与 Codex 同口径)
 
+import calendar
 import os
 import sys
 import glob
@@ -265,6 +267,13 @@ MUSE_DIR = os.path.abspath(os.path.expanduser(
 _CMDCODE_DEFAULT_DIR = os.path.join(HOME, ".commandcode")
 CMDCODE_DIR = os.path.abspath(os.path.expanduser(
     os.environ.get("TOKEI_CMDCODE_DIR") or _CMDCODE_DEFAULT_DIR))
+_COPILOT_DEFAULT_DIR = os.path.join(HOME, ".copilot")
+COPILOT_DIR = os.path.abspath(os.path.expanduser(
+    os.environ.get("TOKEI_COPILOT_DIR") or _COPILOT_DEFAULT_DIR))
+COPILOT_CLI_DIR = COPILOT_DIR
+GITHUB_COPILOT_DIR = COPILOT_DIR
+COPILOT_HOME = COPILOT_DIR
+GITHUB_COPILOT_HOME = COPILOT_DIR
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _USER_DIR = os.path.join(HOME, ".tokei")
@@ -287,6 +296,9 @@ def _writable_path(name):
 
 PRICING_FILE = _writable_path("pricing.json")
 OVERRIDES_FILE = _writable_path("pricing_overrides.json")
+OFFICIAL_PRICING_FILE = os.path.join(_USER_DIR, "pricing_official.json")
+PRICING_UPDATE_STATE = os.path.join(_USER_DIR, "pricing_update_state.json")
+_OPENAI_PRICING_URL = "https://developers.openai.com/api/docs/pricing.md"
 CODEX_QUOTA_CACHE = _writable_path("codex_quota_cache.json")
 CODEX_RESET_CARDS_CACHE = _writable_path("codex_reset_cards_cache.json")
 CLAUDE_QUOTA_CACHE = _writable_path("claude_quota_cache.json")
@@ -294,6 +306,14 @@ GROK_QUOTA_CACHE = _writable_path("grok_quota_cache.json")
 QWENWORK_QUOTA_CACHE = _writable_path("qwenwork_quota_cache.json")
 PROVIDER_QUOTA_CACHE = _writable_path("provider_quota_cache.json")
 ANTIGRAVITY_SCAN_CACHE = _writable_path("antigravity_scan_cache.json")
+ANTIGRAVITY_CREDENTIALS_CACHE = _writable_path("antigravity_credentials.json")
+# IDE 会把语言服务器的 pid / 端口 / CSRF 写进 daemon/ls_*.json；CLI 目前不写。
+# 命令行走不通时靠这些文件兜底，读到之后仍要校验 pid 活着、端口真的在听。
+ANTIGRAVITY_DAEMON_DIRS = (
+    os.path.join(HOME, ".gemini", "antigravity", "daemon"),
+    os.path.join(HOME, ".gemini", "antigravity-ide", "daemon"),
+    os.path.join(HOME, ".gemini", "antigravity-backup", "daemon"),
+)
 
 # 每 1M token 美元单价。基准价来自 OpenRouter,外置在 pricing.json(由 --update-prices 同步);
 # pricing_overrides.json 做本地修正(write1h / 别名 / 缺漏),一键更新不覆盖它。
@@ -321,6 +341,7 @@ _DEFAULT_PRICES = {
     "openai/gpt-6-astra":            {"in": 10.0,  "out": 50.0, "cache_read": 1.0,    "cache_write": 12.5},
     "openai/gpt-6-sol":              {"in": 2.0,   "out": 10.0, "cache_read": 0.2,    "cache_write": 2.5},
     "openai/gpt-6.1-sol":            {"in": 2.0,   "out": 10.0, "cache_read": 0.1,    "cache_write": 2.5},
+    "openai/gpt-6.1-terra":          {"in": 1.0,   "out": 5.0,  "cache_read": 0.05,   "cache_write": 1.25},
     "openai/gpt-6-luna":             {"in": 0.1,   "out": 0.5,  "cache_read": 0.01,   "cache_write": 0.125},
     "qwen/qwen3.8-max":              {"in": 2.0,   "out": 6.0,  "cache_read": 0.25,   "cache_write": 2.5},
     "qwen/qwen3.7-max":              {"in": 1.25,  "out": 3.75, "cache_read": 0.25,   "cache_write": 1.5625},
@@ -415,13 +436,35 @@ def _load_json(path, default):
 
 _PRICING_DB = _load_json(PRICING_FILE, {}).get("models", {})
 
+
+def _valid_price_number(value):
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and 0 <= value < 1_000_000)
+
+
+def _load_official_pricing():
+    payload = _load_json(OFFICIAL_PRICING_FILE, {})
+    models = payload.get("models", {}) if isinstance(payload, dict) else {}
+    if not isinstance(models, dict):
+        return {}
+    return {model: price for model, price in models.items()
+            if isinstance(model, str) and model.startswith("openai/")
+            and isinstance(price, dict) and price.get("source") == _OPENAI_PRICING_URL
+            and all(_valid_price_number(price.get(k)) for k in ("in", "out", "cache_read"))
+            and ("cache_write" not in price or _valid_price_number(price["cache_write"]))
+            and price["in"] > 0 and price["out"] > 0}
+
+
+_OFFICIAL_PRICING_DB = _load_official_pricing()
+
 # 已安装版本会保留用户自己的 pricing_overrides.json。关键官方修正也随脚本内置，
 # 这样升级后立即生效；用户仍可覆盖单价，已确认的官方别名保持固定映射。
 _BUILTIN_OVERRIDE_MODELS = {
-    # OpenAI Standard API rates, verified 2026-09-23 (gpt-6.1-sol 2026-09-30):
+    # OpenAI Standard API rates, verified 2026-09-23 (Sol 6.1 09-30, Terra 6.1 10-27):
     # https://developers.openai.com/api/docs/pricing
     **{model: dict(_DEFAULT_PRICES[model]) for model in (
-        "openai/gpt-6-astra", "openai/gpt-6-sol", "openai/gpt-6.1-sol", "openai/gpt-6-luna",
+        "openai/gpt-6-astra", "openai/gpt-6-sol", "openai/gpt-6.1-sol",
+        "openai/gpt-6.1-terra", "openai/gpt-6-luna",
     )},
     "openai/gpt-5.6-sol": {
         "in": 4.0, "out": 20.0, "cache_read": 0.4, "cache_write": 5.0,
@@ -436,13 +479,23 @@ _BUILTIN_OVERRIDE_ALIASES = {
 }
 
 
-def _merge_pricing_overrides(overrides):
+def _merge_pricing_overrides(overrides, official=None):
     overrides = overrides if isinstance(overrides, dict) else {}
     user_models = overrides.get("models")
     user_aliases = overrides.get("aliases")
-    models = dict(_BUILTIN_OVERRIDE_MODELS)
+    official = _OFFICIAL_PRICING_DB if official is None else official
+    fields = ("in", "out", "cache_read", "cache_write")
+    models = {model: dict(price) for model, price in _BUILTIN_OVERRIDE_MODELS.items()}
+    for model, price in official.items():
+        models[model] = {**models.get(model, {}),
+                         **{key: price[key] for key in fields if key in price}}
     if isinstance(user_models, dict):
-        models.update(user_models)
+        for model, price in user_models.items():
+            # 安装时复制的内置默认值允许被新核实的官方价更新；真正的自定义值仍优先。
+            if model in official and price == _BUILTIN_OVERRIDE_MODELS.get(model):
+                continue
+            if isinstance(price, dict):
+                models[model] = {**models.get(model, {}), **price}
     aliases = dict(user_aliases) if isinstance(user_aliases, dict) else {}
     aliases.update(_BUILTIN_OVERRIDE_ALIASES)
     return models, aliases
@@ -459,20 +512,25 @@ _CLAUDE_LONG_PROMPT_TIERS = {
 }
 
 
-def _effective_pricing_map(catalog=None):
+def _effective_pricing_map(catalog=None, overrides=None, official=None):
     fields = ("in", "out", "cache_read", "cache_write", "write1h")
     catalog = catalog if isinstance(catalog, dict) else _PRICING_DB
-    model_ids = set(_DEFAULT_PRICES) | set(catalog) | set(_OV_MODELS)
+    overrides = _OV_MODELS if overrides is None else overrides
+    official = _OFFICIAL_PRICING_DB if official is None else official
+    model_ids = set(_DEFAULT_PRICES) | set(catalog) | set(overrides)
     result = {}
     for model in model_ids:
         value = dict(_DEFAULT_PRICES.get(model, {}))
         value.update(catalog.get(model, {}))
-        value.update(_OV_MODELS.get(model, {}))
+        value.update(overrides.get(model, {}))
         result[model] = {field: value.get(field, 0.0) for field in fields}
         # 分档规则也算价格的一部分：规则变了，缓存里这个模型的成本要跟着重算。
         tier = _CLAUDE_LONG_PROMPT_TIERS.get(model)
         if tier:
             result[model]["long_prompt"] = list(tier)
+        profile = official.get(model, {}).get("long_context")
+        if profile:
+            result[model]["long_context"] = profile
     return result
 
 
@@ -969,7 +1027,7 @@ _SCAN_CACHE_FILE = _DEFAULT_SCAN_CACHE_FILE
 _SCAN_CACHE_VERSION = 21
 _SCAN_CACHE_MIGRATABLE_VERSION = 19
 _CODEX_EVENT_CACHE_SUFFIX = ".codex-events"
-_CODEX_PARSER_VERSION = 8
+_CODEX_PARSER_VERSION = 9
 _CODEX_ACCOUNTING_VERSION = 7
 
 
@@ -1231,6 +1289,7 @@ def _load_scan_cache():
                         pending.add(model)
             else:
                 pending.update(_BUILTIN_REPRICE_MODELS)
+                pending.update(_OFFICIAL_PRICING_DB)
                 multipliers.update(_BUILTIN_REPRICE_MULTIPLIERS)
             previous_aliases = c.get("_pricing_aliases")
             if isinstance(previous_aliases, dict):
@@ -1958,6 +2017,10 @@ def _empty_cmdcode():
     return _empty_opencode()
 
 
+def _empty_copilot():
+    return _empty_opencode()
+
+
 def _empty_zcode():
     return _empty_opencode()
 
@@ -2242,6 +2305,7 @@ def _format_token_models(models, include_prices=True, price_model=None):
             price_id = None
         elif price_model is not None:
             price_id = price_model(model_id) if model_id else None
+            price_id = _pricing_id(price_id) or price_id
         else:
             price_id = _pricing_id(model_id) if model_id else None
         p = _raw_price(price_id) if price_id else {
@@ -2873,6 +2937,9 @@ def _claude_usage(line, want_dt=False):
 # 接口(约 2880 次/天)。额度对应的是周窗口,变化很慢,拉长到 5 分钟没有感知差别。
 _CODEX_QUOTA_TTL = 300
 _CODEX_QUOTA_FALLBACK_TTL = 300
+# 额度耗尽、还没到重置时刻时放慢到每小时查一次。不直接睡到重置：
+# 官方提前重置、升级套餐、充值 Credits 都得靠这次复查才看得到。
+_QUOTA_EXHAUSTED_RECHECK_TTL = 3600
 _CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 _CODEX_USAGE_MAX_RESPONSE_BYTES = 256 * 1024
 _CODEX_RESET_CARDS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
@@ -2945,7 +3012,48 @@ def _codex_limits_have_active_window(limits, now_epoch=None):
     return False
 
 
-def _cached_codex_live_limits(max_age, allow_active_window=False, account_key=None):
+def _codex_limits_exhausted_reset_at(limits, now_epoch=None):
+    """额度耗尽且有未来的重置时刻时返回最早重置时间戳；未耗尽返回 None。
+
+    当 5h 窗口或周配额已用满 (used_percent >= 100) 时，在重置之前官方接口
+    并不会提前释放额度，期间每 5 分钟重复请求既毫无意义又容易招致 429。
+    有正额度 Credits 垫底时不视为耗尽。
+    任一窗口已过重置时刻也返回 None：那一格的读数已经失真，得去刷新。
+    """
+    if not isinstance(limits, dict):
+        return None
+    credits = limits.get("credits")
+    if isinstance(credits, dict) and credits.get("has_credits"):
+        try:
+            if float(credits.get("balance") or 0) > 0:
+                return None
+        except (TypeError, ValueError):
+            pass
+    now = float(now_epoch if now_epoch is not None else datetime.now().timestamp())
+    exhausted_resets = []
+    future_resets = []
+    for slot_name in ("primary", "secondary"):
+        slot = limits.get(slot_name) or {}
+        used = slot.get("used_percent")
+        reset = slot.get("resets_at")
+        try:
+            if reset is None:
+                continue
+            reset_epoch = float(reset)
+            if reset_epoch <= now:
+                return None
+            future_resets.append(reset_epoch)
+            if used is not None and float(used) >= 100.0:
+                exhausted_resets.append(reset_epoch)
+        except (TypeError, ValueError, OverflowError):
+            continue
+    if not exhausted_resets and limits.get("rate_limit_reached_type"):
+        exhausted_resets = future_resets
+    return min(exhausted_resets) if exhausted_resets else None
+
+
+def _cached_codex_live_limits(max_age, allow_active_window=False, account_key=None,
+                              auth_key=None, now_epoch=None):
     cached = _load_json(CODEX_QUOTA_CACHE, {})
     fetched_at = cached.get("fetched_at")
     limits = cached.get("limits")
@@ -2954,13 +3062,19 @@ def _cached_codex_live_limits(max_age, allow_active_window=False, account_key=No
     cached_account_key = cached.get("account_key")
     if account_key and cached_account_key and cached_account_key != account_key:
         return None
+    cached_auth_key = cached.get("auth_key")
+    if auth_key and cached_auth_key and cached_auth_key != auth_key:
+        return None
+    now = float(now_epoch if now_epoch is not None else datetime.now().timestamp())
     try:
         fetched_at = float(fetched_at)
     except (TypeError, ValueError, OverflowError):
         return None
-    age = datetime.now().timestamp() - fetched_at
+    age = now - fetched_at
+    if _codex_limits_exhausted_reset_at(limits, now_epoch=now) is not None:
+        max_age = max(max_age, _QUOTA_EXHAUSTED_RECHECK_TTL)
     if age > max_age and not (
-            allow_active_window and _codex_limits_have_active_window(limits)):
+            allow_active_window and _codex_limits_have_active_window(limits, now_epoch=now)):
         return None
     return limits, cached.get("plan"), fetched_at
 
@@ -3083,9 +3197,6 @@ def fetch_codex_live_limits():
         except Exception:
             pass
         return None
-    cached = _cached_codex_live_limits(_CODEX_QUOTA_TTL)
-    if cached:
-        return cached
     auth = _load_json(CODEX_AUTH, {})
     auth_context = _codex_auth_context(auth)
     access_token = auth_context.get("access_token")
@@ -3093,10 +3204,11 @@ def fetch_codex_live_limits():
     auth_key = auth_context.get("auth_key")
     if not access_token or not account_key:
         return None
-    cache_state = _load_json(CODEX_QUOTA_CACHE, {})
-    cached = _cached_codex_live_limits(_CODEX_QUOTA_TTL, account_key=account_key)
+    cached = _cached_codex_live_limits(
+        _CODEX_QUOTA_TTL, account_key=account_key, auth_key=auth_key)
     if cached:
         return cached
+    cache_state = _load_json(CODEX_QUOTA_CACHE, {})
     # 失败退避:网络不可达(如公司代理拦截)时 5 分钟内不再联网重试,
     # 否则每轮 30s 刷新都会白等约 6s 超时
     last_failure = cache_state.get("last_failure_at", 0)
@@ -3644,7 +3756,20 @@ def _codex_price_model(model):
 
 
 def _codex_estimated_cost(model, inp, cached, out):
-    base = _raw_price(_codex_price_model(model))
+    priced_model = _codex_price_model(model)
+    base = _raw_price(priced_model)
+    price_id = _pricing_id(priced_model)
+    profile = _OFFICIAL_PRICING_DB.get(price_id, {}).get("long_context")
+    overrides = _OVERRIDES if isinstance(_OVERRIDES, dict) else {}
+    custom_models = overrides.get("models")
+    custom = custom_models.get(price_id) if isinstance(custom_models, dict) else None
+    if (isinstance(profile, dict)
+            and (custom is None or custom == _BUILTIN_OVERRIDE_MODELS.get(price_id))
+            and isinstance(profile.get("threshold"), int) and 0 < profile["threshold"] <= 10_000_000
+            and all(_valid_price_number(profile.get(k)) for k in ("in", "out", "cache_read"))):
+        tier = profile if inp > profile["threshold"] else base
+        return ((inp - cached) * tier["in"] + cached * tier["cache_read"]
+                + out * tier["out"]) / 1e6
     high_context = inp > 272_000
     input_price = base["in"] * (2 if high_context else 1)
     output_price = base["out"] * (1.5 if high_context else 1)
@@ -4219,6 +4344,92 @@ _CODEX_OUTPUT_ITEM = re.compile(rb'"item":\{"type":"(Reasoning|AgentMessage)"')
 _CODEX_ITEM_STARTED = re.compile(rb'"started_at_ms":(\d+)')
 
 
+class _CodexZstdStream:
+    """Normalize decoder errors and own an optional CLI decoder process."""
+
+    def __init__(self, inner, process=None):
+        self._inner = inner
+        self._process = process
+
+    def _read(self, method, n):
+        try:
+            data = getattr(self._inner, method)(n)
+            if self._process is not None and (not data and n != 0 or n < 0):
+                status = self._process.wait(timeout=1)
+                if status:
+                    raise OSError(f"zstd decoder exited with status {status}")
+            return data
+        except OSError:
+            raise
+        except Exception as exc:
+            raise OSError(str(exc)) from exc
+
+    def read(self, n=-1):
+        return self._read("read", n)
+
+    def readline(self, n=-1):
+        return self._read("readline", n)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        try:
+            self._inner.close()
+        finally:
+            process = self._process
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=1)
+
+
+def _open_codex_rollout(path):
+    """Open a rollout without rewriting the compressed source."""
+    path = os.fspath(path)
+    if not path.endswith(".zst"):
+        return open(path, "rb", buffering=0)
+    stream = None
+    try:
+        from compression import zstd as _zstd  # Python 3.14+
+        stream = _zstd.open(path, "rb")
+    except Exception:
+        stream = None
+    if stream is None:
+        source = None
+        try:
+            import io
+            import zstandard as _zstandard
+            source = open(path, "rb", buffering=0)
+            stream = io.BufferedReader(
+                _zstandard.ZstdDecompressor().stream_reader(source))
+        except Exception:
+            if source is not None:
+                source.close()
+            stream = None
+    if stream is not None:
+        return _CodexZstdStream(stream)
+    import shutil
+    candidates = ["/opt/homebrew/bin/zstd", "/usr/local/bin/zstd", "/usr/bin/zstd"]
+    path_exe = shutil.which("zstd")
+    if path_exe:
+        candidates.append(path_exe)
+    for exe in dict.fromkeys(candidates):
+        if not os.path.exists(exe):
+            continue
+        try:
+            process = subprocess.Popen([exe, "-dc", "--", path],
+                                       stdout=subprocess.PIPE,
+                                       stderr=subprocess.DEVNULL, **_NO_WINDOW)
+        except OSError:
+            continue
+        return _CodexZstdStream(process.stdout, process)
+    raise OSError("no zstd decoder available")
+
+
 def _iter_codex_usage_records(path, chunk_size=64 * 1024, header_limit=1024,
                               model_limit=64 * 1024, start_offset=0, end_offset=None):
     """Yield model changes and token records without buffering unrelated large JSONL lines.
@@ -4232,7 +4443,7 @@ def _iter_codex_usage_records(path, chunk_size=64 * 1024, header_limit=1024,
     candidate = None
     kind = None
 
-    with open(path, "rb", buffering=0) as fh:
+    with _open_codex_rollout(path) as fh:
         if start_offset:
             fh.seek(start_offset)
         while True:
@@ -4417,7 +4628,7 @@ def _codex_session_cwd(path, max_lines=8, max_line_bytes=128 * 1024):
     只认 session_meta 那一行：按 cwd 匹配会一路扫到后面的大事件行上去,
     几千个会话累计起来就是几十秒。"""
     try:
-        with open(path, "rb", buffering=0) as fh:
+        with _open_codex_rollout(path) as fh:
             for _ in range(max_lines):
                 line = fh.readline(max_line_bytes)
                 if not line:
@@ -4439,7 +4650,7 @@ def _codex_session_cwd(path, max_lines=8, max_line_bytes=128 * 1024):
 
 def _codex_session_meta(path, max_lines=20, max_line_bytes=2 * 1024 * 1024):
     try:
-        with open(path, "rb", buffering=0) as fh:
+        with _open_codex_rollout(path) as fh:
             for _ in range(max_lines):
                 line = fh.readline(max_line_bytes)
                 if not line:
@@ -4478,7 +4689,10 @@ def _codex_rollout_files():
     files = []
     seen = set()
     for root in roots:
-        for path in sorted(glob.glob(os.path.join(root, "**", "rollout-*.jsonl"), recursive=True)):
+        paths = glob.glob(os.path.join(root, "**", "rollout-*.jsonl"), recursive=True)
+        # Codex Desktop compacts old rollouts to zstd ('legacy_to_paginated_v1').
+        paths += glob.glob(os.path.join(root, "**", "rollout-*.jsonl.zst"), recursive=True)
+        for path in sorted(paths):
             real = _realpath_in_dir(path)
             key = os.path.normcase(real)
             if key not in seen and os.path.isfile(real):
@@ -4611,6 +4825,7 @@ def scan_codex(bounds, cache, local_only=False):
         except OSError:
             continue
         mtime, size = st.st_mtime, st.st_size
+        is_zst = f.endswith(".zst")
         try:
             is_active = active_root is not None and os.path.commonpath((f, active_root)) == active_root
         except ValueError:
@@ -4631,10 +4846,12 @@ def scan_codex(bounds, cache, local_only=False):
                 or entry.get("parser_version") != _CODEX_PARSER_VERSION
                 or entry.get("accounting_version") != _CODEX_ACCOUNTING_VERSION
                 or not event_cache_ready or f in perf_backfill):
-            complete_offset = _codex_complete_offset(f, size)
+            # Compressed rollouts are immutable snapshots: always parse them whole
+            # (offsets would refer to compressed bytes, not records).
+            complete_offset = None if is_zst else _codex_complete_offset(f, size)
             file_id = f"{st.st_dev}:{st.st_ino}"
             append_from = None
-            if (isinstance(entry, dict) and f not in perf_backfill
+            if (isinstance(entry, dict) and f not in perf_backfill and not is_zst
                     and entry.get("parser_version") == _CODEX_PARSER_VERSION
                     and entry.get("accounting_version") == _CODEX_ACCOUNTING_VERSION):
                 old_offset = int(entry.get("parsed_size", 0) or 0)
@@ -4876,7 +5093,8 @@ def scan_codex(bounds, cache, local_only=False):
                 "perf_v": (_CODEX_PERF_VERSION if append_from is None
                            else (entry.get("perf_v") if isinstance(entry, dict) else None)),
                 "file_id": file_id, "parsed_size": complete_offset,
-                "parsed_guard": _codex_offset_guard(f, complete_offset),
+                "parsed_guard": (None if complete_offset is None
+                                 else _codex_offset_guard(f, complete_offset)),
                 "event_cache_size": event_cache_size,
                 "event_count": metadata["event_count"],
                 "first_keys": metadata["first_keys"],
@@ -6097,7 +6315,7 @@ def _scan_grok_billing_from_log(path=None, max_bytes=_GROK_QUOTA_LOG_SCAN_BYTES)
         latest["config"], plan=latest.get("plan"), source="log", updated=updated)
 
 
-def _cached_grok_quota(max_age):
+def _cached_grok_quota(max_age, now_epoch=None, exhausted_max_age=None):
     cached = _load_json(GROK_QUOTA_CACHE, {})
     if not isinstance(cached, dict):
         return None
@@ -6105,10 +6323,21 @@ def _cached_grok_quota(max_age):
     fetched_at = cached.get("fetched_at")
     if not isinstance(quota, dict) or fetched_at is None:
         return None
+    now = float(now_epoch if now_epoch is not None else datetime.now().timestamp())
     try:
-        age = datetime.now().timestamp() - float(fetched_at)
+        fetched_at = float(fetched_at)
     except (TypeError, ValueError):
         return None
+    pct = quota.get("pct")
+    reset = quota.get("reset")
+    try:
+        # 只有实时查询的入口传 exhausted_max_age；本地兜底路径保持原来的时效。
+        if (exhausted_max_age is not None and pct is not None
+                and float(pct) >= 100.0 and reset is not None and float(reset) > now):
+            max_age = max(max_age, exhausted_max_age)
+    except (TypeError, ValueError, OverflowError):
+        pass
+    age = now - fetched_at
     if age > max_age:
         return None
     out = dict(quota)
@@ -6138,7 +6367,8 @@ def fetch_grok_live_quota():
     """仅在用户开启时请求 Grok billing API;失败回退到短缓存。"""
     if not _grok_live_quota_enabled():
         return None
-    cached = _cached_grok_quota(_GROK_QUOTA_TTL)
+    cached = _cached_grok_quota(
+        _GROK_QUOTA_TTL, exhausted_max_age=_QUOTA_EXHAUSTED_RECHECK_TTL)
     if cached and cached.get("source") == "live":
         return cached
     token, expired = _grok_auth_state()
@@ -6806,6 +7036,28 @@ def _provider_credential_marker(provider, *parts):
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
+def _provider_quota_exhausted_reset_at(quota, now_epoch=None):
+    """Return the earliest exhausted reset while all known windows remain active."""
+    if not isinstance(quota, dict):
+        return None
+    now = float(now_epoch if now_epoch is not None else datetime.now().timestamp())
+    exhausted_resets = []
+    for window in quota.get("windows") or []:
+        if not isinstance(window, dict):
+            continue
+        # A model-specific limit must not slow polling for other usable models.
+        if window.get("scope") == "model":
+            continue
+        used = _provider_number(window.get("used_pct"))
+        reset_epoch = _provider_number(window.get("reset"))
+        # Another window may reset before the exhausted window does.
+        if reset_epoch is not None and reset_epoch <= now:
+            return None
+        if used is not None and used >= 100.0 and reset_epoch is not None:
+            exhausted_resets.append(reset_epoch)
+    return min(exhausted_resets) if exhausted_resets else None
+
+
 def _cached_provider_quota(provider, marker, max_age, now_epoch=None, stale=False):
     with _PROVIDER_QUOTA_CACHE_LOCK:
         root = _load_json(PROVIDER_QUOTA_CACHE, {})
@@ -6818,7 +7070,13 @@ def _cached_provider_quota(provider, marker, max_age, now_epoch=None, stale=Fals
     if fetched_at is None or not isinstance(quota, dict):
         return None
     age = now_epoch - int(fetched_at)
-    if age < -300 or age > max_age:
+    if age < -300:
+        return None
+    exhausted_until = _provider_quota_exhausted_reset_at(quota, now_epoch=now_epoch)
+    # Exhaustion slows polling, but recheck at least hourly for changed limits.
+    if max_age is not None and exhausted_until is not None and age < 3600:
+        max_age = max(max_age, 3600)
+    if max_age is not None and age > max_age:
         return None
     out = json.loads(json.dumps(quota))
     if stale:
@@ -6840,7 +7098,13 @@ def _latest_cached_provider_quota(provider, max_age=None, now_epoch=None, stale=
     if fetched_at is None or not isinstance(quota, dict):
         return None
     age = now_epoch - int(fetched_at)
-    if age < -300 or (max_age is not None and age > max_age):
+    if age < -300:
+        return None
+    exhausted_until = _provider_quota_exhausted_reset_at(quota, now_epoch=now_epoch)
+    # Exhaustion slows polling, but recheck at least hourly for changed limits.
+    if max_age is not None and exhausted_until is not None and age < 3600:
+        max_age = max(max_age, 3600)
+    if max_age is not None and age > max_age:
         return None
     out = json.loads(json.dumps(quota))
     if stale:
@@ -6924,6 +7188,7 @@ def _save_provider_quota_attempt(provider, marker, attempted_at=None, result="fa
 def _provider_json_request(url, *, headers=None, method="GET", body=None, timeout=5,
                            max_bytes=_PROVIDER_QUOTA_MAX_RESPONSE_BYTES,
                            allow_insecure_loopback_tls=False):
+    import ipaddress
     import ssl
     import urllib.error
     import urllib.request
@@ -6947,6 +7212,13 @@ def _provider_json_request(url, *, headers=None, method="GET", body=None, timeou
             return None
 
     handlers = [NoRedirect()]
+    # Local capability headers must never be routed through environment/system proxies.
+    try:
+        loopback = ipaddress.ip_address(parsed.hostname).is_loopback
+    except ValueError:
+        loopback = parsed.hostname == "localhost"
+    if loopback:
+        handlers.append(urllib.request.ProxyHandler({}))
     if context is not None:
         handlers.append(urllib.request.HTTPSHandler(context=context))
     opener = urllib.request.build_opener(*handlers)
@@ -7425,6 +7697,26 @@ def _windows_native_bridge():
     return _WINDOWS_NATIVE_BRIDGE
 
 
+def _windows_process_alive(pid):
+    # Windows 上 os.kill(pid, 0) 会结束进程；只查询进程状态。
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel.OpenProcess(0x1000, False, pid)
+    if not handle:
+        return ctypes.get_last_error() == 5
+    try:
+        code = wintypes.DWORD()
+        return bool(kernel.GetExitCodeProcess(handle, ctypes.byref(code)) and code.value == 259)
+    finally:
+        kernel.CloseHandle(handle)
+
+
 def _grok_bot_helper_running(state):
     pid, started = state.get("pid"), state.get("started")
     if not isinstance(pid, int) or not isinstance(started, (int, float)):
@@ -7432,23 +7724,7 @@ def _grok_bot_helper_running(state):
     if _time.time() - started > _GROK_BOT_HELPER_MAX_RUNTIME:
         return False
     if _IS_WINDOWS:
-        # Windows 上 os.kill(pid, 0) 会结束进程；只查询进程状态。
-        import ctypes
-        from ctypes import wintypes
-        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-        kernel.OpenProcess.restype = wintypes.HANDLE
-        kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
-        kernel.GetExitCodeProcess.restype = wintypes.BOOL
-        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-        handle = kernel.OpenProcess(0x1000, False, pid)
-        if not handle:
-            return ctypes.get_last_error() == 5
-        try:
-            code = wintypes.DWORD()
-            return bool(kernel.GetExitCodeProcess(handle, ctypes.byref(code)) and code.value == 259)
-        finally:
-            kernel.CloseHandle(handle)
+        return _windows_process_alive(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -8641,6 +8917,320 @@ def _windows_powershell(script, timeout=10):
     return result.stdout.decode("utf-8", errors="replace")
 
 
+def _antigravity_proc_env(pid):
+    """读取指定进程的环境变量字典（支持 macOS 与 Linux）。"""
+    if not pid or pid <= 0:
+        return {}
+    if not _IS_WINDOWS and sys.platform == "darwin":
+        try:
+            import ctypes, ctypes.util
+            libc = ctypes.CDLL(ctypes.util.find_library("c"))
+            mib = (ctypes.c_int * 3)(1, 49, int(pid))  # CTL_KERN = 1, KERN_PROCARGS2 = 49
+            size = ctypes.c_size_t(0)
+            if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0:
+                return {}
+            buf = ctypes.create_string_buffer(size.value)
+            if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
+                return {}
+            raw = buf.raw
+            if len(raw) < 8:
+                return {}
+            argc = int.from_bytes(raw[:4], byteorder="little")
+            pos = 4
+            end = raw.find(b"\0", pos)
+            if end == -1:
+                return {}
+            pos = end
+            while pos < len(raw) and raw[pos] == 0:
+                pos += 1
+            for _ in range(argc):
+                end = raw.find(b"\0", pos)
+                if end == -1:
+                    break
+                pos = end + 1
+            env = {}
+            while pos < len(raw):
+                end = raw.find(b"\0", pos)
+                if end == -1:
+                    break
+                entry = raw[pos:end]
+                if entry:
+                    try:
+                        line = entry.decode("utf-8", "ignore")
+                        if "=" in line:
+                            k, v = line.split("=", 1)
+                            env[k] = v
+                    except Exception:
+                        pass
+                pos = end + 1
+            return env
+        except Exception:
+            return {}
+    elif not _IS_WINDOWS and sys.platform.startswith("linux"):
+        try:
+            with open(f"/proc/{int(pid)}/environ", "rb") as f:
+                raw = f.read()
+            env = {}
+            for entry in raw.split(b"\0"):
+                if not entry:
+                    continue
+                try:
+                    line = entry.decode("utf-8", "ignore")
+                    if "=" in line:
+                        k, v = line.split("=", 1)
+                        env[k] = v
+                except Exception:
+                    pass
+            return env
+        except Exception:
+            return {}
+    return {}
+
+
+def _discover_antigravity_credentials(processes=None):
+    """发现并缓存 Antigravity 的 CSRF Token 与服务端口。"""
+    # 1. 优先读取系统环境变量 (如由 agy 子进程或当前终端环境启动)
+    token = os.environ.get("ANTIGRAVITY_CSRF_TOKEN")
+    addr = os.environ.get("ANTIGRAVITY_LS_ADDRESS")
+    if token:
+        port = _provider_integer(addr.split(":")[-1]) if addr and ":" in addr else None
+        return {p["pid"]: (token, port) for p in (processes or [])} or {0: (token, port)}
+
+    # 2. 读取持久化凭据缓存
+    cached_root = _load_json(ANTIGRAVITY_CREDENTIALS_CACHE, {})
+    cached_creds = cached_root.get("credentials") if isinstance(cached_root, dict) and isinstance(cached_root.get("credentials"), dict) else {}
+
+    discovered = {}
+    missing_procs = []
+    for proc in (processes or []):
+        pid_str = str(proc.get("pid"))
+        if pid_str in cached_creds:
+            c = cached_creds[pid_str]
+            if isinstance(c, dict) and c.get("token"):
+                discovered[proc["pid"]] = (c.get("token"), c.get("port"))
+                continue
+        missing_procs.append(proc)
+
+    # 3. 检查进程自身环境 (针对 cli 进程)
+    for proc in missing_procs:
+        env = _antigravity_proc_env(proc.get("pid"))
+        t = env.get("ANTIGRAVITY_CSRF_TOKEN")
+        a = env.get("ANTIGRAVITY_LS_ADDRESS")
+        if t:
+            port = _provider_integer(a.split(":")[-1]) if a and ":" in a else None
+            discovered[proc["pid"]] = (t, port)
+
+    # 4. 如果还有进程未找到 CSRF token，扫描当前系统上运行的进程环境
+    needed = [p for p in (processes or []) if p["pid"] not in discovered]
+    if needed and not _IS_WINDOWS and sys.platform == "darwin":
+        try:
+            import ctypes, ctypes.util
+            libc = ctypes.CDLL(ctypes.util.find_library("c"))
+            out = subprocess.run(["/bin/ps", "-ax", "-o", "pid="],
+                                 capture_output=True, text=True, timeout=2, check=False).stdout
+            pids = [int(p) for p in out.split() if p.isdigit()]
+            for p in pids:
+                mib = (ctypes.c_int * 3)(1, 49, p)
+                size = ctypes.c_size_t(0)
+                if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0:
+                    continue
+                buf = ctypes.create_string_buffer(size.value)
+                if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
+                    continue
+                raw = buf.raw
+                if b"ANTIGRAVITY_CSRF_TOKEN=" not in raw:
+                    continue
+                t, a = None, None
+                for part in raw.split(b"\0"):
+                    if part.startswith(b"ANTIGRAVITY_CSRF_TOKEN="):
+                        t = part.split(b"=", 1)[1].decode("utf-8", "ignore")
+                    elif part.startswith(b"ANTIGRAVITY_LS_ADDRESS="):
+                        a = part.split(b"=", 1)[1].decode("utf-8", "ignore")
+                if t:
+                    port = _provider_integer(a.split(":")[-1]) if a and ":" in a else None
+                    for proc in needed:
+                        discovered[proc["pid"]] = (t, port)
+                    discovered[0] = (t, port)
+                    break
+        except Exception:
+            pass
+    elif needed and not _IS_WINDOWS and sys.platform.startswith("linux"):
+        try:
+            import glob
+            for env_path in glob.glob("/proc/[0-9]*/environ"):
+                try:
+                    with open(env_path, "rb") as f:
+                        raw = f.read()
+                    if b"ANTIGRAVITY_CSRF_TOKEN=" not in raw:
+                        continue
+                    t, a = None, None
+                    for part in raw.split(b"\0"):
+                        if part.startswith(b"ANTIGRAVITY_CSRF_TOKEN="):
+                            t = part.split(b"=", 1)[1].decode("utf-8", "ignore")
+                        elif part.startswith(b"ANTIGRAVITY_LS_ADDRESS="):
+                            a = part.split(b"=", 1)[1].decode("utf-8", "ignore")
+                    if t:
+                        port = _provider_integer(a.split(":")[-1]) if a and ":" in a else None
+                        for proc in needed:
+                            discovered[proc["pid"]] = (t, port)
+                        discovered[0] = (t, port)
+                        break
+                except (OSError, IOError):
+                    continue
+        except Exception:
+            pass
+
+    return discovered
+
+
+def _antigravity_pid_alive(pid):
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if _IS_WINDOWS:
+        return _windows_process_alive(pid)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _antigravity_port_open(port):
+    """端口上有没有活着的进程在听。只用来否掉过期 LS 地址,不做服务识别。"""
+    import socket
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return False
+    if not 0 < port <= 65535:
+        return False
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.25):
+            return True
+    except OSError:
+        return False
+
+
+def _antigravity_daemon_credentials():
+    """IDE 的 daemon 发现文件里有 pid/端口/CSRF;命令行拿不到 token 时用它兜底。"""
+    found = []
+    for directory in ANTIGRAVITY_DAEMON_DIRS:
+        for path in glob.glob(os.path.join(directory, "ls_*.json")):
+            data = _load_json(path, {})
+            if not isinstance(data, dict):
+                continue
+            pid = _provider_integer(data.get("pid"))
+            token = data.get("csrfToken")
+            if not pid or not isinstance(token, str) or not token:
+                continue
+            if not _antigravity_pid_alive(pid):
+                continue
+            ports = [port for port in (_provider_integer(data.get("httpsPort")),
+                                       _provider_integer(data.get("httpPort")))
+                     if port]
+            found.append({"pid": pid, "token": token, "ports": ports, "path": path})
+    return found
+
+
+def _antigravity_merge_daemon_processes(processes, daemons):
+    """daemon 文件里 pid 还活着且端口在听的进程,即使 ps 没认出来也补进列表。"""
+    by_pid = {proc["pid"]: proc for proc in processes}
+    for entry in daemons:
+        pid = entry["pid"]
+        proc = by_pid.get(pid)
+        if not _antigravity_pid_alive(pid):
+            continue
+        listening = proc.get("ports") if proc is not None else None
+        if listening is None:
+            listening = _antigravity_listening_ports(pid)
+        live_ports = [port for port in entry["ports"] if port in listening]
+        if not live_ports:
+            continue
+        if proc is None:
+            proc = {
+                "pid": pid, "kind": "ide", "csrf_token": "",
+                "extension_port": None, "extension_csrf_token": None,
+                "ports": listening, "daemon_ports": live_ports,
+            }
+            processes.append(proc)
+            by_pid[pid] = proc
+        else:
+            proc["ports"] = listening
+        if not proc.get("csrf_token"):
+            proc["csrf_token"] = entry["token"]
+        if not proc.get("daemon_ports"):
+            proc["daemon_ports"] = live_ports
+    return processes
+
+
+def _antigravity_attach_credentials(processes, discovered):
+    """把发现的 token 挂到进程上;LS 端口已经没了的旧 token 直接丢弃。"""
+    candidates = {}
+    for proc in processes:
+        token, port = discovered.get(proc["pid"], discovered.get(0, (None, None)))
+        if token and not proc.get("csrf_token"):
+            candidates[proc["pid"]] = (token, port)
+    # 没有候选 token 就不必为每个进程跑一次 lsof;端点那边用到时会自己补。
+    if candidates:
+        for proc in processes:
+            if proc.get("ports") is None:
+                proc["ports"] = _antigravity_listening_ports(proc["pid"])
+        live_ports = set()
+        for proc in processes:
+            live_ports.update(proc.get("ports") or [])
+        for proc in processes:
+            token, port = candidates.get(proc["pid"], (None, None))
+            if not token:
+                continue
+            stale = bool(port) and port not in live_ports and not _antigravity_port_open(port)
+            if stale:
+                continue
+            proc["csrf_token"] = token
+            if port:
+                proc["ls_port"] = port
+    saved = {}
+    for proc in processes:
+        if proc.get("csrf_token"):
+            saved[str(proc["pid"])] = {
+                "token": proc["csrf_token"], "port": proc.get("ls_port")}
+    return saved
+
+
+def _antigravity_drop_credentials(pid):
+    """token 被服务端判无效时只删这一条,别把别的进程(比如 IDE)的凭据一起清掉。"""
+    try:
+        root = _load_json(ANTIGRAVITY_CREDENTIALS_CACHE, {})
+        credentials = root.get("credentials") if isinstance(root, dict) else None
+        if not isinstance(credentials, dict):
+            return
+        if credentials.pop(str(pid), None) is None:
+            return
+        _atomic_write_json(ANTIGRAVITY_CREDENTIALS_CACHE, {
+            "credentials": credentials,
+            "updated": int(datetime.now().timestamp()),
+        })
+    except OSError:
+        pass
+
+
+def _antigravity_error_priority(error):
+    """401/403 是凭据问题,比 SSL/连接错误更值得往上抛。"""
+    text = str(error or "")
+    if "HTTP 401" in text or "HTTP 403" in text:
+        return 3
+    if isinstance(error, TimeoutError) or "timed out" in text.lower():
+        return 2
+    return 1
+
+
 def _antigravity_running_processes(now_epoch=None):
     if _antigravity_scan_recently_empty(now_epoch):
         return []
@@ -8657,6 +9247,20 @@ def _antigravity_running_processes(now_epoch=None):
         except (OSError, subprocess.SubprocessError):
             return []
     processes = _antigravity_process_infos(output)
+    daemons = _antigravity_daemon_credentials()
+    if daemons:
+        processes = _antigravity_merge_daemon_processes(processes, daemons)
+    if processes:
+        discovered = _discover_antigravity_credentials(processes)
+        credentials_to_save = _antigravity_attach_credentials(processes, discovered)
+        # 每次扫描都整份重写,顺手把已经退出的进程凭据清掉。
+        try:
+            _atomic_write_json(ANTIGRAVITY_CREDENTIALS_CACHE, {
+                "credentials": credentials_to_save,
+                "updated": int(now_epoch if now_epoch is not None else datetime.now().timestamp()),
+            })
+        except OSError:
+            pass
     _record_antigravity_scan(bool(processes), now_epoch)
     return processes
 
@@ -8682,14 +9286,26 @@ def _antigravity_listening_ports(pid):
 
 def _antigravity_endpoints(process):
     endpoints = []
+    csrf = process.get("csrf_token") or ""
+    requires_csrf = bool(csrf)
     extension_port = process.get("extension_port")
     if extension_port:
-        for token in (process.get("extension_csrf_token"), process.get("csrf_token")):
+        for token in (process.get("extension_csrf_token"), csrf):
             if token is not None:
                 endpoints.append(("http", extension_port, token, True))
-    for port in _antigravity_listening_ports(process["pid"]):
-        endpoints.append(("https", port, process.get("csrf_token") or "",
-                          process.get("kind") != "cli"))
+    ports = process.get("ports")
+    ports = list(ports if ports is not None else _antigravity_listening_ports(process["pid"]))
+    for port in process.get("daemon_ports") or []:
+        if port not in ports:
+            ports.insert(0, port)
+    ls_port = process.get("ls_port")
+    # 拿不到监听表(Windows / 没有 lsof)时保留旧行为;拿到了就只信真实在听的端口,
+    # 否则环境里残留的旧 LS 地址会被一遍遍重试,真正的 401 反而被 SSL 错误盖住。
+    if ls_port and ls_port not in ports and not ports:
+        ports.insert(0, ls_port)
+    for port in ports:
+        endpoints.append(("http", port, csrf, requires_csrf))
+        endpoints.append(("https", port, csrf, requires_csrf))
     unique = []
     for endpoint in endpoints:
         if endpoint not in unique:
@@ -8699,8 +9315,11 @@ def _antigravity_endpoints(process):
 
 def _antigravity_request(endpoint, path, body):
     scheme, port, csrf, requires_csrf = endpoint
-    headers = {"Connect-Protocol-Version": "1"}
-    if requires_csrf:
+    headers = {
+        "Connect-Protocol-Version": "1",
+        "Content-Type": "application/json",
+    }
+    if requires_csrf and csrf:
         headers["X-Codeium-Csrf-Token"] = csrf
     return _provider_json_request(
         f"{scheme}://127.0.0.1:{port}{path}", headers=headers, method="POST", body=body,
@@ -8734,7 +9353,9 @@ def _normalize_antigravity_quota_summary(payload, updated=None):
         if not isinstance(group, dict):
             continue
         display = str(group.get("displayName") or "").lower()
-        if "gemini" in display:
+        if "gemini" in display and "argon" in display:
+            family = "gemini-argon"
+        elif "gemini" in display:
             family = "gemini"
         elif any(name in display for name in ("claude", "gpt", "third")):
             family = "3p"
@@ -8754,21 +9375,27 @@ def _normalize_antigravity_quota_summary(payload, updated=None):
                 continue
             buckets.setdefault(f"{family}-{cadence_id}", bucket)
     rows = []
-    # Match the official shared quota groups, never individual model variants.
-    # Missing windows stay unknown; a model quota cannot stand in for a week.
+    # Keep shared quotas separate from explicitly reported model quota groups.
+    # Missing windows stay unknown; a model quota cannot stand in for a shared one.
     if buckets:
-        for bucket_id, title, minutes in _ANTIGRAVITY_QUOTA_WINDOWS:
+        windows = list(_ANTIGRAVITY_QUOTA_WINDOWS)
+        if "gemini-argon-weekly" in buckets:
+            windows.append(("gemini-argon-weekly", "Gemini 4 Argon 周", 10080))
+        for bucket_id, title, minutes in windows:
             bucket = buckets.get(bucket_id, {})
             # Connect JSON flattens the oneof; older clients wrap `remaining`.
             remaining = _antigravity_remaining(bucket)
             if remaining is None:
                 remaining = _antigravity_remaining(bucket.get("remaining"))
-            rows.append(_provider_window(
+            row = _provider_window(
                 "antigravity-" + bucket_id, title,
                 (1 - remaining) * 100 if remaining is not None else None,
                 bucket.get("resetTime"), minutes,
                 "暂时无法读取" if remaining is None else None,
-                usage_known=remaining is not None))
+                usage_known=remaining is not None)
+            if bucket_id == "gemini-argon-weekly":
+                row["scope"] = "model"
+            rows.append(row)
     return {
         "available": bool(rows),
         "plan": None, "account": None, "windows": rows, "details": [],
@@ -8808,11 +9435,12 @@ def fetch_antigravity_quota():
         if not endpoints:
             continue
         marker = _provider_credential_marker(
-            "antigravity", "quota-summary-v3", process.get("pid"),
+            "antigravity", "quota-summary-v4", process.get("pid"),
             process.get("csrf_token"), endpoints)
         cached = _cached_provider_quota("antigravity", marker, _PROVIDER_QUOTA_TTL)
         if cached:
             return cached
+        process_error = None
         for endpoint in endpoints:
             try:
                 summary_payload = _antigravity_request(
@@ -8829,7 +9457,18 @@ def fetch_antigravity_quota():
                     _save_provider_quota_cache("antigravity", marker, quota)
                     return quota
             except Exception as error:
-                last_error = error
+                if process_error is None or (
+                        _antigravity_error_priority(error)
+                        > _antigravity_error_priority(process_error)):
+                    process_error = error
+        if process_error is not None:
+            # 只有服务端明确说凭据无效才丢弃;SSL/超时说明不了 token 好坏。
+            if _antigravity_error_priority(process_error) >= 3:
+                _antigravity_drop_credentials(process.get("pid"))
+            if last_error is None or (
+                    _antigravity_error_priority(process_error)
+                    > _antigravity_error_priority(last_error)):
+                last_error = process_error
         fallback = _cached_provider_quota(
             "antigravity", marker, _PROVIDER_QUOTA_FALLBACK_TTL, stale=True)
         if fallback:
@@ -10403,10 +11042,15 @@ def scan_hermes(bounds, cache):
 
 # ---------- OpenClaw ----------
 # 全局 SQLite: $OPENCLAW_STATE_DIR/state/openclaw.sqlite（任务 + agent DB 注册表）
-# Agent SQLite: agent_databases.path -> transcript_events.event_json（新版 token 用量）
+# Agent SQLite: agent_databases.path -> transcript_events（新版 token 用量）
+#   transcript_events 的事件正文有两种互斥存储：event_json(TEXT) 与
+#   event_zstd(BLOB, zstd 压缩)。以 event_json 为非空判断是旧形态；只要
+#   event_json 为 NULL 就必须解压 event_zstd，否则用量事件被整条丢弃。
 # Session JSONL: $OPENCLAW_STATE_DIR/agents/*/sessions/*.jsonl（旧版 token 用量）
 # 3：附上每条回复的端到端耗时。
-_OPENCLAW_PARSER_VERSION = 3
+# 4：读 event_zstd（zstd 压缩正文），不再静默丢压缩存储的用量事件。
+# 5：标准库优先，强制正文和窗口上限，并拒绝不完整或额外帧。
+_OPENCLAW_PARSER_VERSION = 5
 _OPENCLAW_LEDGER_VERSION = 2
 
 
@@ -10460,6 +11104,94 @@ def _scan_openclaw_db(db_path, sqlite_module):
         return task_days
     finally:
         conn.close()
+
+
+# Bound output independently of frame-declared size, and bound decoder windows.
+_OPENCLAW_MAX_EVENT_BYTES = 4 * 1024 * 1024
+_OPENCLAW_MAX_WINDOW_LOG = 22
+_OPENCLAW_ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+_OPENCLAW_ZSTD_AVAILABLE = None
+
+
+def _openclaw_zstd_available():
+    """Probe existing stdlib/optional decoders once; never install dependencies."""
+    global _OPENCLAW_ZSTD_AVAILABLE
+    if _OPENCLAW_ZSTD_AVAILABLE is None:
+        try:
+            from compression import zstd  # noqa: F401
+        except Exception:
+            try:
+                import zstandard  # noqa: F401
+            except Exception:
+                _OPENCLAW_ZSTD_AVAILABLE = False
+            else:
+                _OPENCLAW_ZSTD_AVAILABLE = True
+        else:
+            _OPENCLAW_ZSTD_AVAILABLE = True
+    return _OPENCLAW_ZSTD_AVAILABLE
+
+
+def _openclaw_zstd_blob(value):
+    """解压 event_zstd 的 BLOB 正文，失败返回 None（调用方跳过该行）。"""
+    if not isinstance(value, (bytes, bytearray, memoryview)):
+        return None
+    data = bytes(value)
+    if not data or data[:4] != _OPENCLAW_ZSTD_MAGIC:
+        return None
+    if not _openclaw_zstd_available():
+        return None
+    try:
+        from compression import zstd
+    except Exception:
+        zstd = None
+    limit = _OPENCLAW_MAX_EVENT_BYTES
+    try:
+        if zstd is not None:
+            decoder = zstd.ZstdDecompressor(options={
+                zstd.DecompressionParameter.window_log_max:
+                    _OPENCLAW_MAX_WINDOW_LOG,
+            })
+            result = decoder.decompress(data, max_length=limit + 1)
+            if len(result) > limit or not decoder.eof or decoder.unused_data:
+                return None
+            return result
+
+        import io
+        import zstandard
+        parameters = zstandard.get_frame_parameters(data)
+        if parameters.window_size > 1 << _OPENCLAW_MAX_WINDOW_LOG:
+            return None
+        decoder = zstandard.ZstdDecompressor(max_window_size=limit)
+        # max_output_size alone can be ignored for known-size frames.
+        # Read across frames so even trailing output is covered by the budget.
+        with decoder.stream_reader(io.BytesIO(data),
+                                   read_across_frames=True) as reader:
+            result = reader.read(limit + 1)
+        if len(result) > limit:
+            return None
+        # A raw stream can stop on truncated input without raising. Only after
+        # its bounded pass establishes the output ceiling, validate one complete
+        # frame. Release the first output before this bounded second pass.
+        del result, decoder
+        validator = zstandard.ZstdDecompressor(
+            max_window_size=limit).decompressobj()
+        result = validator.decompress(data)
+        if len(result) > limit or not validator.eof or validator.unused_data:
+            return None
+        return result
+    except Exception:
+        return None
+
+
+def _openclaw_event_text(event_json, event_zstd):
+    """取事件正文（bytes）用于 json.loads。
+
+    两种存储互斥：优先 event_json，其次解压 event_zstd。均不可用时返回 None。
+    event_json 在 SQLite 里若存成 BLOB，json.loads 也能吃 bytes（且支持 UTF-8 BOM）。
+    """
+    if event_json is not None:
+        return event_json
+    return _openclaw_zstd_blob(event_zstd)
 
 
 def _openclaw_agent_db_paths(sqlite_module):
@@ -10625,8 +11357,15 @@ def _scan_openclaw_agent_db(db_path, sqlite_module):
         if "transcript_events" not in tables:
             raise sqlite_module.OperationalError("missing transcript_events")
         columns = {row[1] for row in conn.execute("PRAGMA table_info(transcript_events)")}
-        if not {"session_id", "seq", "event_json", "created_at"}.issubset(columns):
+        if not {"session_id", "seq", "created_at"}.issubset(columns):
             raise sqlite_module.OperationalError("incompatible transcript_events")
+        if "event_json" not in columns and "event_zstd" not in columns:
+            raise sqlite_module.OperationalError("incompatible transcript_events")
+
+        # 正文可能有三种列组合：旧库只有 event_json；压缩库两者都有；更早/更窄的
+        # 只读视图可能缺其中一列。SELECT 里始终保留两列名，用常量 NULL 占位。
+        json_expr = "event_json" if "event_json" in columns else "NULL"
+        zstd_expr = "event_zstd" if "event_zstd" in columns else "NULL"
 
         session_models = {}
         if "session_windows" in tables:
@@ -10640,9 +11379,12 @@ def _scan_openclaw_agent_db(db_path, sqlite_module):
 
         sessions = {}
         seen_events = {}
-        for session_id, seq, raw_event, created_at in conn.execute(
-                "SELECT session_id, seq, event_json, created_at "
+        for session_id, seq, raw_json, raw_zstd, created_at in conn.execute(
+                f"SELECT session_id, seq, {json_expr}, {zstd_expr}, created_at "
                 "FROM transcript_events ORDER BY session_id, seq"):
+            raw_event = _openclaw_event_text(raw_json, raw_zstd)
+            if raw_event is None:
+                continue
             try:
                 event = json.loads(raw_event)
             except (TypeError, ValueError):
@@ -10784,13 +11526,15 @@ def scan_openclaw(bounds, cache):
     # --- Part 2: dynamically discovered agent SQLite usage ---
     registry_ok, agent_db_paths = _openclaw_agent_db_paths(_sq)
     active_sqlite_keys = set()
+    zstd_available = _openclaw_zstd_available()
     for agent_db_path in agent_db_paths:
         entry_key = "sqlite:" + os.path.realpath(agent_db_path)
         active_sqlite_keys.add(entry_key)
         sig = _sqlite_signature(agent_db_path)
         entry = fc.get(entry_key)
         needs_scan = (not entry or entry.get("parser_version") != _OPENCLAW_PARSER_VERSION
-                      or entry.get("path") != agent_db_path or entry.get("sig") != sig)
+                      or entry.get("path") != agent_db_path or entry.get("sig") != sig
+                      or entry.get("zstd_available") != zstd_available)
         if sig and needs_scan:
             try:
                 sessions = _scan_openclaw_agent_db(agent_db_path, _sq)
@@ -10798,6 +11542,7 @@ def scan_openclaw(bounds, cache):
                 continue
             fc[entry_key] = {"source": "sqlite", "path": agent_db_path, "sig": sig,
                              "parser_version": _OPENCLAW_PARSER_VERSION,
+                             "zstd_available": zstd_available,
                              "sessions": sessions}
             changed = True
     if registry_ok:
@@ -13074,7 +13819,7 @@ def scan_devin(bounds, cache):
 
 # ---------- MiniMax Code ----------
 # 桌面端的本地运行时库：~/.minimax/v2/sqlite/runtime-state.sqlite。
-# local_runtime_token_usage 每轮对话一行，四个桶并列相加（raw 里的
+# local_runtime_token_usage 每次模型调用一行，四个桶并列相加（raw 里的
 # totalTokens = input + output + cacheRead + cacheWrite），托管登录下
 # cost_usd 恒为 0。model 列目前是空的，真实模型只出现在按小时轮转的
 # observability 日志里：
@@ -13083,8 +13828,10 @@ def scan_devin(bounds, cache):
 #
 # 日志会被轮转删掉，所以对上号的结果按行号区间压缩存进扫描缓存（runs），
 # 日志没了模型也不丢；还没等到库里那一行的 turn 暂存在 pending 里。
-# 2：附上每轮回复的计时（首字延迟、生成时间）。
-_MINIMAX_SCAN_VERSION = 2
+# 2：附上回复计时。3：按会话、轮次和 Token 桶逐次匹配，旧计时标注含等待。
+_MINIMAX_SCAN_VERSION = 3
+# 只更新速率解析时不升级 Token/费用口径，避免覆盖本地数据清理前的账本高水位。
+_MINIMAX_LEDGER_VERSION = 2
 _MINIMAX_LOG_MARKER = b"llm_response_identifiers"
 _MINIMAX_PENDING_TTL = 2 * 24 * 3600
 
@@ -13176,35 +13923,134 @@ def _minimax_run_lookup(runs, through):
     return lookup
 
 
-def _minimax_turn_timing(connection, tables):
-    """turn_id → (回复写入时刻 ms, 生成耗时 ms, 请求总耗时 ms)。
+def _minimax_perf_ms(value):
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            return value if math.isfinite(value) and value >= 0 else None
+        except OverflowError:
+            pass
+    return None
 
-    只认一轮里只有一条助手回复的：一轮里调了好几次模型（中间夹着工具），
-    用量是整轮合计，拿写入时刻减请求时刻会把工具时间也算进去。
+
+def _minimax_usage_fingerprint(values):
+    try:
+        if all(isinstance(value, (int, float)) and not isinstance(value, bool)
+               and math.isfinite(value) and value >= 0 and int(value) == value
+               for value in values):
+            return tuple(int(value) for value in values)
+    except OverflowError:
+        pass
+    return None
+
+
+def _minimax_request_timings(connection, tables, rows):
+    """用量行 id → (回复写入、生成耗时、请求总耗时、可用落盘时间)。
+
+    同一轮包含多次模型调用；用会话、轮次和四个 Token 桶匹配各自的回复。
+    Token 桶重复时只接受不重叠的请求时间窗口；旧消息没保存 Token 桶时，
+    仅单次调用、单条回复可回退。配对不明确时不猜，不重复使用同一条计时。
     """
     import sqlite3
+    from collections import Counter, defaultdict
+
     if "local_runtime_message_rows" not in tables:
         return {}
     columns = {row[1] for row in connection.execute(
         "PRAGMA table_info(local_runtime_message_rows)")}
-    if not {"role", "turn_id", "created_at_ms", "data_json"} <= columns:
+    if not {"session_id", "role", "turn_id", "created_at_ms", "data_json"} <= columns:
         return {}
-    timing, counts = {}, {}
+
+    messages, legacy = defaultdict(list), {}
+    message_counts = Counter()
+    tool_turns = set()
     try:
-        for turn_id, created_ms, decode_ms, request_ms in connection.execute("""
-                SELECT turn_id, created_at_ms,
-                       json_extract(data_json, '$.usage.decode_duration_ms'),
-                       json_extract(data_json, '$.usage.request_duration_ms')
+        for session_id, turn_id, created_ms, raw in connection.execute("""
+                SELECT session_id, turn_id, created_at_ms,
+                       CASE WHEN json_valid(data_json)
+                            THEN json_extract(data_json, '$.usage', '$.tool_calls') END
                 FROM local_runtime_message_rows WHERE role = 'assistant'"""):
-            if not turn_id:
+            if not session_id or not turn_id:
                 continue
-            counts[turn_id] = counts.get(turn_id, 0) + 1
-            timing[turn_id] = (created_ms if isinstance(created_ms, (int, float)) else None,
-                               decode_ms if isinstance(decode_ms, (int, float)) else None,
-                               request_ms if isinstance(request_ms, (int, float)) else None)
+            turn = (session_id, turn_id)
+            message_counts[turn] += 1
+            try:
+                usage, tool_calls = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            if tool_calls:
+                tool_turns.add(turn)
+            if usage is None:
+                usage = {}
+            if not isinstance(usage, dict):
+                continue
+            timing = tuple(_minimax_perf_ms(value) for value in (
+                created_ms, usage.get("decode_duration_ms"), usage.get("request_duration_ms")))
+            fields = ("input_tokens", "output_tokens", "cache_read", "cache_write")
+            if not any(field in usage for field in fields):
+                legacy[turn] = timing
+                continue
+            fingerprint = _minimax_usage_fingerprint((usage.get("input_tokens"),
+                usage.get("output_tokens"), usage.get("cache_read", 0), usage.get("cache_write", 0)))
+            if fingerprint is not None:
+                messages[turn + (fingerprint,)].append(timing)
     except sqlite3.Error:
         return {}
-    return {turn: value for turn, value in timing.items() if counts[turn] == 1}
+
+    requests, turn_requests = defaultdict(list), defaultdict(list)
+    for row in rows:
+        if not row[1] or not row[2]:
+            continue
+        turn = (row[1], row[2])
+        turn_requests[turn].append(row)
+        fingerprint = _minimax_usage_fingerprint((row[5], row[6], row[8] or 0, row[9] or 0))
+        if fingerprint is not None:
+            requests[turn + (fingerprint,)].append(row)
+
+    timings, windows = {}, {}
+    for key, group in requests.items():
+        candidates = messages.get(key, [])
+        if len(group) == len(candidates) == 1:
+            timings[group[0][0]] = candidates[0]
+            continue
+        if not candidates:
+            continue
+        turn = key[:2]
+        if turn not in windows:
+            starts = Counter(value for row in turn_requests[turn]
+                             if (value := _minimax_perf_ms(row[4])) is not None)
+            ordered = sorted(starts)
+            windows[turn] = {value: ordered[index + 1] if index + 1 < len(ordered) else math.inf
+                             for index, value in enumerate(ordered) if starts[value] == 1}
+        for row in group:
+            start = _minimax_perf_ms(row[4])
+            end = windows[turn].get(start)
+            if end is None:
+                continue
+            matching = [candidate for candidate in candidates
+                        if candidate[0] is not None and start < candidate[0] <= end]
+            if len(matching) == 1:
+                timings[row[0]] = matching[0]
+
+    for turn, timing in legacy.items():
+        if message_counts[turn] == 1 and len(turn_requests[turn]) == 1:
+            timings[turn_requests[turn][0][0]] = timing
+    single_requests = {group[0][0] for turn, group in turn_requests.items()
+                       if len(group) == 1 and message_counts[turn] == 1 and turn not in tool_turns}
+    return {row_id: (*timing, row_id in single_requests) for row_id, timing in timings.items()}
+
+
+def _minimax_request_timing(timing, started_ms):
+    end_ms, decode_ms, request_ms, allow_persistence = timing
+    if decode_ms is not None and decode_ms > 0 and (request_ms is None or request_ms >= decode_ms):
+        return (decode_ms / 1000,
+                (request_ms - decode_ms) / 1000 if request_ms is not None else None, False)
+    if request_ms is not None and request_ms > 0:
+        return request_ms / 1000, None, True
+    start = _minimax_perf_ms(started_ms)
+    # completed message 可能等工具执行完才落盘；旧多轮记录无法还原各次模型结束时刻。
+    if allow_persistence and end_ms is not None and start is not None and end_ms > start:
+        return (end_ms - start) / 1000, None, True
+    return None
 
 
 def _scan_minimax_database(path, pending, runs, through):
@@ -13220,6 +14066,8 @@ def _scan_minimax_database(path, pending, runs, through):
     connection = sqlite3.connect(_sqlite_ro_uri(path), uri=True, timeout=1)
     try:
         connection.execute("PRAGMA query_only=ON")
+        # 运行中的客户端会继续写入；用量和消息必须读自同一份数据库快照。
+        connection.execute("BEGIN")
         tables = {row[0] for row in connection.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
         if "local_runtime_token_usage" not in tables:
@@ -13259,7 +14107,7 @@ def _scan_minimax_database(path, pending, runs, through):
             FROM local_runtime_token_usage
             ORDER BY id ASC
         """).fetchall()
-        turn_timing = _minimax_turn_timing(connection, tables)
+        request_timings = _minimax_request_timings(connection, tables, rows)
     finally:
         connection.close()
 
@@ -13307,7 +14155,8 @@ def _scan_minimax_database(path, pending, runs, through):
         if stamp is None:
             continue
         try:
-            created = datetime.fromtimestamp(stamp).astimezone()
+            # 这里只取本机日期和小时，fromtimestamp 已完成本地时区转换。
+            created = datetime.fromtimestamp(stamp)
         except (OSError, OverflowError, ValueError):
             continue
         if not model:
@@ -13324,19 +14173,15 @@ def _scan_minimax_database(path, pending, runs, through):
 
         day_key = created.date().isoformat()
         day = days.setdefault(day_key, _empty_token_day())
-        day["_cost_version"] = _MINIMAX_SCAN_VERSION
+        day["_cost_version"] = _MINIMAX_LEDGER_VERSION
         _add_token_usage(day, inp, out, cache_read, cache_write, reason, cost, display_model)
-        timing = turn_timing.get(row[2])
+        timing = request_timings.get(row[0])
         if timing:
-            end_ms, decode_ms, request_ms = timing
-            if decode_ms and request_ms and request_ms >= decode_ms:
-                # 新版客户端直接记了生成耗时和请求总耗时
+            duration = _minimax_request_timing(timing, ts)
+            if duration:
+                seconds, ttft, includes_wait = duration
                 _perf_add(day.setdefault("perf", {}), display_model, out + reason,
-                          decode_ms / 1000, (request_ms - decode_ms) / 1000)
-            elif end_ms and isinstance(ts, (int, float)) and end_ms > ts:
-                # 旧版只有回复写入时间：从用量行的请求时刻算起，端到端
-                _perf_add(day.setdefault("perf", {}), display_model, out + reason,
-                          (end_ms - ts) / 1000)
+                          seconds, ttft, includes_wait=includes_wait)
         project = session_projects.get(session_id)
         if project:
             bucket = day.setdefault("projects", {}).setdefault(
@@ -14016,7 +14861,33 @@ def _kimi_limits_have_active_window(limits, now_epoch=None):
     return False
 
 
-def _cached_kimi_live_limits(max_age, auth_key, allow_active_window=False):
+def _kimi_limits_exhausted_reset_at(limits, now_epoch=None):
+    """Kimi 额度耗尽且有未来的重置时刻时返回最早重置时间戳；未耗尽返回 None。
+
+    任一窗口已过重置时刻也返回 None：那一格的读数已经失真，得去刷新。
+    """
+    if not isinstance(limits, dict):
+        return None
+    now = float(now_epoch if now_epoch is not None else datetime.now().timestamp())
+    exhausted_resets = []
+    for slot_key in ("five_hour", "subscription"):
+        slot = (limits or {}).get(slot_key) or {}
+        used = slot.get("used_percent")
+        reset = slot.get("resets_at")
+        try:
+            if reset is None:
+                continue
+            reset_epoch = float(reset)
+            if reset_epoch <= now:
+                return None
+            if used is not None and float(used) >= 100.0:
+                exhausted_resets.append(reset_epoch)
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return min(exhausted_resets) if exhausted_resets else None
+
+
+def _cached_kimi_live_limits(max_age, auth_key, allow_active_window=False, now_epoch=None):
     cached = _load_json(KIMI_QUOTA_CACHE, {})
     if not auth_key or cached.get("auth_key") != auth_key:
         return None
@@ -14024,13 +14895,16 @@ def _cached_kimi_live_limits(max_age, auth_key, allow_active_window=False):
     limits = cached.get("limits")
     if not fetched_at or not limits:
         return None
+    now = float(now_epoch if now_epoch is not None else datetime.now().timestamp())
     try:
         fetched_at = float(fetched_at)
     except (TypeError, ValueError, OverflowError):
         return None
-    age = datetime.now().timestamp() - fetched_at
+    age = now - fetched_at
+    if _kimi_limits_exhausted_reset_at(limits, now_epoch=now) is not None:
+        max_age = max(max_age, _QUOTA_EXHAUSTED_RECHECK_TTL)
     if age > max_age and not (
-            allow_active_window and _kimi_limits_have_active_window(limits)):
+            allow_active_window and _kimi_limits_have_active_window(limits, now_epoch=now)):
         return None
     return limits, cached.get("plan"), fetched_at
 
@@ -14956,6 +15830,534 @@ def scan_cmdcode(bounds, cache):
     return {"ranges": B}
 
 
+# ---------- GitHub Copilot CLI ----------
+# 会话日志 ~/.copilot/session-state/<sid>/events.jsonl,其中 session.shutdown 事件
+# 的 modelMetrics 带每模型 token 与 premium requests 用量。按会话开始时间归日。
+_COPILOT_PARSER_VERSION = 7
+
+
+def _copilot_roots():
+    candidates = []
+    for global_name in ("COPILOT_DIR", "COPILOT_CLI_DIR", "GITHUB_COPILOT_DIR",
+                        "COPILOT_HOME", "GITHUB_COPILOT_HOME"):
+        value = globals().get(global_name)
+        if isinstance(value, str) and value.strip():
+            candidates.append(value)
+    for env_name in ("TOKEI_COPILOT_DIR", "TOKEI_COPILOT_CLI_DIR",
+                     "COPILOT_HOME", "GITHUB_COPILOT_HOME", "TOKEI_COPILOT_HOME"):
+        value = os.environ.get(env_name)
+        if value:
+            candidates.append(value)
+    if not candidates:
+        candidates = [_COPILOT_DEFAULT_DIR]
+    roots = []
+    seen = set()
+    for candidate in candidates:
+        root = os.path.realpath(os.path.expanduser(candidate))
+        key = os.path.normcase(root)
+        if key not in seen:
+            seen.add(key)
+            roots.append(root)
+    return roots
+
+
+def _copilot_session_files():
+    files = []
+    for root in _copilot_roots():
+        if not os.path.isdir(root):
+            continue
+        # 优先 events.jsonl
+        for dirpath, dirnames, filenames in os.walk(root):
+            for name in filenames:
+                if name == "events.jsonl" or name.endswith(".jsonl") or name.endswith(".db") or name.endswith(".sqlite"):
+                    files.append(os.path.realpath(os.path.join(dirpath, name)))
+    return sorted({os.path.normcase(path): path for path in files}.values())
+
+
+def _copilot_number(value):
+    if isinstance(value, bool):
+        return 0
+    try:
+        return max(int(value or 0), 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _copilot_datetime(value):
+    if isinstance(value, str) and value:
+        try:
+            text = value.strip()
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+            dt = datetime.fromisoformat(text)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone()
+        except (TypeError, ValueError):
+            return None
+    # epoch (ms or s)
+    try:
+        epoch = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(epoch):
+        return None
+    if epoch > 100_000_000_000_000:
+        epoch /= 1_000_000
+    elif epoch > 100_000_000_000:
+        epoch /= 1000
+    try:
+        return datetime.fromtimestamp(epoch).astimezone()
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def _copilot_output_tokens(output, reasoning):
+    """Copilot reasoningTokens is a subset of raw outputTokens."""
+    output = _copilot_number(output)
+    reasoning = min(output, _copilot_number(reasoning))
+    return output - reasoning, reasoning
+
+
+def _copilot_reported(target, inp=0, cr=0, cw=0):
+    # Numeric-only cache metadata; never part of normalized usage or billing.
+    for key, value in (("_reported_in", inp), ("_reported_cr", cr), ("_reported_cw", cw)):
+        target[key] = target.get(key, 0) + _copilot_number(value)
+
+
+def _scan_copilot_db(path):
+    days = {}
+    sid = None
+    proj = None
+    try:
+        import sqlite3
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        cur = conn.cursor()
+        cur.execute("""SELECT e.session_id, e.model, e.input_tokens, e.output_tokens,
+                              e.cache_read_tokens, e.cache_write_tokens, e.reasoning_tokens,
+                              e.created_at, s.cwd
+                       FROM assistant_usage_events e
+                       LEFT JOIN sessions s ON s.id = e.session_id""")
+        for row in cur.fetchall():
+            sess, model, inp, out, cr, cw, reason, created_at, cwd = row
+            dt = _copilot_datetime(created_at)
+            if dt is None:
+                continue
+            day_key = dt.date().isoformat()
+            day = days.setdefault(day_key, _empty_token_day())
+            i = _copilot_number(inp)
+            o, r = _copilot_output_tokens(out, reason)
+            c = _copilot_number(cr); w = _copilot_number(cw)
+            _copilot_reported(day, i, c, w)
+            _add_token_usage(day, out=o, reason=r, model=model)
+            if isinstance(sess, str) and sess:
+                if sess not in day.setdefault("sessions", []):
+                    day["sessions"].append(sess)
+            if isinstance(cwd, str) and cwd:
+                project = day.setdefault("projects", {}).setdefault(cwd, {
+                    "tokens": 0, "cost": 0.0, "models": {}, "sessions": []})
+                project["tokens"] += o + r
+                if model:
+                    project["models"][model] = project["models"].get(model, 0) + o + r
+                if isinstance(sess, str) and sess and sess not in project["sessions"]:
+                    project["sessions"].append(sess)
+            if sid is None and isinstance(sess, str):
+                sid = sess
+            if proj is None and isinstance(cwd, str) and cwd:
+                proj = cwd
+        conn.close()
+    except Exception:
+        pass
+    return days, sid, proj
+
+
+def _copilot_text(*values):
+    return next((value for value in values if isinstance(value, str) and value), None)
+
+
+def _copilot_record_project(record, data):
+    for source in (record, data):
+        for key in ("cwd", "project", "workspace", "gitRoot"):
+            value = source.get(key)
+            if isinstance(value, str) and value:
+                return value
+        context = source.get("context")
+        if isinstance(context, dict):
+            value = _copilot_text(context.get("cwd"), context.get("gitRoot"))
+            if value:
+                return value
+    return None
+
+
+def _copilot_normalized_usage(usage, model):
+    # Preserve both the generic usage aliases and the older nested input map.
+    if not any(key in usage for key in ("inputTokens", "input_tokens", "prompt_tokens")):
+        if isinstance(usage.get("input"), dict):
+            usage = usage["input"]
+    fields = (
+        ("inputTokens", "input_tokens", "prompt_tokens", "input"),
+        ("outputTokens", "output_tokens", "completion_tokens", "output"),
+        ("cacheReadTokens", "cache_read_tokens", "cacheRead", "cached_tokens"),
+        ("cacheWriteTokens", "cache_write_tokens", "cacheWrite"),
+        ("reasoningTokens", "reasoning_tokens", "reasoning"),
+    )
+    values = [_copilot_number(next((usage[key] for key in aliases if key in usage), 0))
+              for aliases in fields]
+    values[1], values[4] = _copilot_output_tokens(values[1], values[4])
+    event = _empty_token_day()
+    _copilot_reported(event, values[0], values[2], values[3])
+    _add_token_usage(event, out=values[1], reason=values[4], model=model)
+    return event
+
+
+def _copilot_has_model_usage(usage):
+    for key in ("outputTokens",):
+        value = usage.get(key)
+        if value is None or isinstance(value, bool):
+            continue
+        try:
+            if int(value) >= 0:
+                return True
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return False
+
+
+def _copilot_preferred_records(records):
+    # A usable shutdown model summary is authoritative for the whole session,
+    # including when request details and the summary live in different files.
+    authoritative = {event["session"] for event in records if event["kind"] == "shutdown"}
+    return [event for event in records
+            if event["session"] not in authoritative or event["kind"] == "shutdown"]
+
+
+def _copilot_add_record(days, day_key, event):
+    day = days.setdefault(day_key, _empty_token_day())
+    usage, sid, proj = event["usage"], event["session"], event.get("project")
+    _merge_live_token_day(day, usage)
+    _copilot_reported(day, usage.get("_reported_in"), usage.get("_reported_cr"), usage.get("_reported_cw"))
+    if sid not in day.setdefault("sessions", []):
+        day["sessions"].append(sid)
+    if proj:
+        project = day.setdefault("projects", {}).setdefault(proj, {
+            "tokens": 0, "cost": 0.0, "models": {}, "sessions": []})
+        project["tokens"] += token_total(usage)
+        project["cost"] += usage.get("cost", 0)
+        for model, value in usage.get("models", {}).items():
+            project["models"][model] = project["models"].get(model, 0) + token_total(value)
+        if sid not in project["sessions"]:
+            project["sessions"].append(sid)
+
+
+def _scan_copilot_session(path):
+    if path.endswith((".db", ".sqlite")):
+        return _scan_copilot_db(path)
+    sid = None
+    proj = None
+    start_dt = None
+    records = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                # Generic usage records need not contain a session event string.
+                try:
+                    record = json.loads(line)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                data = record.get("data")
+                if not isinstance(data, dict):
+                    data = {}
+                row_sid = _copilot_text(record.get("sessionId"), record.get("session_id"),
+                                        data.get("sessionId"), data.get("session_id"))
+                row_proj = _copilot_record_project(record, data)
+                sid = sid or row_sid
+                proj = proj or row_proj
+                dt = next((dt for source in (record, data)
+                           for key in ("timestamp", "startTime", "createdAt", "created_at")
+                           if (dt := _copilot_datetime(source.get(key))) is not None), None)
+                identity = _copilot_text(record.get("id"), record.get("eventId"),
+                                         record.get("requestId"), record.get("request_id"),
+                                         data.get("eventId"), data.get("requestId"),
+                                         data.get("request_id"))
+                kind = record.get("type")
+                if kind == "session.start":
+                    if start_dt is None:
+                        start_dt = _copilot_datetime(data.get("startTime")) or dt
+                    continue
+                if kind == "session.shutdown":
+                    event = _empty_token_day()
+                    authoritative = False
+                    metrics = data.get("modelMetrics")
+                    if isinstance(metrics, dict):
+                        for model, info in metrics.items():
+                            usage = info.get("usage") if isinstance(info, dict) else None
+                            if not isinstance(usage, dict):
+                                continue
+                            if _copilot_has_model_usage(usage):
+                                authoritative = True
+                                normalized = _copilot_normalized_usage(usage, model)
+                                _merge_live_token_day(event, normalized)
+                                _copilot_reported(event, normalized.get("_reported_in"), normalized.get("_reported_cr"), normalized.get("_reported_cw"))
+                    try:
+                        premium = float(data.get("totalPremiumRequests", 0))
+                        if math.isfinite(premium) and premium >= 0:
+                            event["credits"] = premium
+                    except (TypeError, ValueError, OverflowError):
+                        pass
+                    if authoritative or event["credits"] > 0:
+                        records.append({
+                            "id": identity, "kind": "shutdown" if authoritative else "premium",
+                            "timestamp": dt.isoformat() if dt is not None else None,
+                            "day": None, "session_start": data.get("sessionStartTime"),
+                            "session": row_sid, "project": row_proj, "usage": event})
+                    continue
+
+                # Fallbacks: usage at either level, or top-level token fields.
+                usage = record.get("usage")
+                if not isinstance(usage, dict):
+                    usage = data.get("usage")
+                if not isinstance(usage, dict):
+                    usage = next((source for source in (record, data)
+                                  if any(key in source for key in (
+                                      "inputTokens", "input_tokens", "prompt_tokens",
+                                      "outputTokens", "output_tokens", "completion_tokens", "output"))), None)
+                if not isinstance(usage, dict) or dt is None:
+                    continue
+                model = _copilot_text(record.get("model"), record.get("modelId"),
+                                      record.get("model_id"), data.get("model"),
+                                      data.get("modelId"), data.get("model_id"))
+                records.append({
+                    "id": identity, "kind": "fallback",
+                    "timestamp": dt.astimezone(timezone.utc).isoformat(),
+                    "day": dt.date().isoformat(), "session": row_sid,
+                    "project": row_proj, "usage": _copilot_normalized_usage(usage, model)})
+    except OSError:
+        return {}, sid, proj
+
+    sid = sid or (os.path.basename(os.path.dirname(path))
+                  if os.path.basename(path) == "events.jsonl"
+                  else os.path.splitext(os.path.basename(path))[0])
+    if start_dt is None:
+        start_dt = next((dt for event in records
+                         if (dt := _copilot_datetime(event.get("session_start"))) is not None), None)
+    for event in records:
+        event["session"] = event["session"] or sid
+        event["project"] = event["project"] or proj
+        if event["day"] is None:
+            event["day"] = (start_dt or datetime.now().astimezone()).date().isoformat()
+        event.pop("session_start", None)
+    days = {}
+    for event in _copilot_preferred_records(records):
+        _copilot_add_record(days, event["day"], event)
+        # Only normalized accounting/identity metadata is cached, never text.
+        days[event["day"]].setdefault("_events", []).append(event)
+    return days, sid, proj
+
+
+def _copilot_canonical_days(files):
+    """Reconcile mirrors without merging distinct equal-valued requests.
+
+    Physical source aliases count once. All valid DB day.sessions are
+    authoritative; JSON only contributes sessions outside that DB coverage.
+    Stable IDs win. Timestamped id-less rows use per-file multiplicities: exact
+    mirrored occurrences count once, repeated occurrences within a file survive,
+    and disjoint timestamps stay separate. Only untimed/id-less rows need a
+    canonical-file fallback because their separate identity is unknowable.
+    """
+    canonical = {}
+    sessions = {}
+    physical_files = []
+    seen_paths = set()
+    database_sessions = set()
+    for path, entry in sorted(files.items()):
+        if not isinstance(entry, dict):
+            continue
+        canonical[path] = {}
+        physical = os.path.normcase(os.path.realpath(path))
+        if physical in seen_paths:
+            continue
+        seen_paths.add(physical)
+        physical_files.append((path, entry))
+        if path.endswith((".db", ".sqlite")):
+            canonical[path] = entry.get("days", {})
+            # Every valid row contributes its SID to day.sessions. entry.sid
+            # records only the first row and cannot establish DB coverage.
+            for day in canonical[path].values():
+                database_sessions.update(sid for sid in day.get("sessions", [])
+                                         if isinstance(sid, str) and sid.strip())
+
+    for path, entry in physical_files:
+        if path.endswith((".db", ".sqlite")):
+            continue
+        for day_key, day in entry.get("days", {}).items():
+            for event in day.get("_events", []):
+                event = dict(event)
+                event.setdefault("session", entry.get("sid") or path)
+                event.setdefault("project", entry.get("proj"))
+                event.setdefault("day", day_key)
+                # DB usage is authoritative for that session, across all days.
+                # JSON remains a fallback only for sessions absent from valid
+                # DB rows; never infer overlap by timestamps or token values.
+                if event["session"] in database_sessions:
+                    continue
+                sessions.setdefault(event["session"], []).append((path, event))
+
+    for records in sessions.values():
+        if any(event["kind"] == "shutdown" for _, event in records):
+            records = [(path, event) for path, event in records if event["kind"] == "shutdown"]
+        seen_ids = set()
+        per_file = {}
+        mirrored_occurrences = {}
+        untimed = {}
+        for path, event in records:
+            identity = event.get("id")
+            if identity:
+                key = (event["kind"], identity)
+                if key in seen_ids:
+                    continue
+                seen_ids.add(key)
+            elif event.get("timestamp"):
+                # Counter equality alone is never enough to collapse a request.
+                key = json.dumps([event["kind"], event["timestamp"], event.get("project"),
+                                  event["usage"]], sort_keys=True, separators=(",", ":"))
+                file_key = (path, key)
+                occurrence = per_file.get(file_key, 0) + 1
+                per_file[file_key] = occurrence
+                if occurrence <= mirrored_occurrences.get(key, 0):
+                    continue
+                mirrored_occurrences[key] = occurrence
+            else:
+                untimed.setdefault(path, []).append(event)
+                continue
+            _copilot_add_record(canonical[path], event["day"], event)
+
+        if untimed:
+            path, events = max(untimed.items(), key=lambda item: (
+                len(item[1]), sum(token_total(event["usage"]) for event in item[1]), item[0]))
+            for event in events:
+                _copilot_add_record(canonical[path], event["day"], event)
+    return canonical
+
+
+def scan_copilot(bounds, cache):
+    ledger_touch("copilot")
+    fc = cache.setdefault("copilot", {})
+    B = _empty_token_ranges()
+    files = _copilot_session_files()
+    if not files:
+        if fc:
+            fc.clear()
+            cache["_dirty"] = True
+    stale = set(fc)
+    changed = False
+    for path in files:
+        stale.discard(path)
+        try:
+            stat = os.stat(path)
+        except OSError:
+            continue
+        signature = f"{stat.st_mtime_ns}:{stat.st_size}"
+        if path.endswith((".db", ".sqlite")):
+            try:
+                wal = os.stat(path + "-wal")
+                signature += f":{wal.st_mtime_ns}:{wal.st_size}"
+            except OSError:
+                signature += ":no-wal"
+        entry = fc.get(path)
+        if (not isinstance(entry, dict) or entry.get("sig") != signature
+                or entry.get("parser_version") != _COPILOT_PARSER_VERSION):
+            days, sid, proj = _scan_copilot_session(path)
+            fc[path] = {
+                "sig": signature,
+                "days": days,
+                "sid": sid or path,
+                "proj": proj,
+                "parser_version": _COPILOT_PARSER_VERSION,
+            }
+            changed = True
+    for path in stale:
+        fc.pop(path, None)
+        changed = True
+
+    canonical = _copilot_canonical_days(fc)
+    for path, entry in fc.items():
+        days = canonical.get(path, {})
+        if entry.get("canonical_days") != days:
+            entry["canonical_days"] = days
+            changed = True
+    live_days = {}
+    live_sessions = {}
+    live_projects = {}
+    for path, entry in fc.items():
+        if not isinstance(entry, dict):
+            continue
+        for day_key, day in entry.get("canonical_days", {}).items():
+            try:
+                date.fromisoformat(day_key)
+            except (TypeError, ValueError):
+                continue
+            sessions = day.get("sessions") or [entry.get("sid") or path]
+            _merge_live_token_day(live_days.setdefault(day_key, _empty_token_day()), day)
+            live_sessions.setdefault(day_key, set()).update(sessions)
+            projects = day.get("projects") or {}
+            live_projects.setdefault(day_key, set()).update(projects)
+    for day_key, day in live_days.items():
+        # Replace prior double-counted live days through the existing ledger
+        # schema migration contract, preserving days whose source logs are gone.
+        day["_ledger_version"] = _COPILOT_PARSER_VERSION
+        day["sessions"] = sorted(live_sessions.get(day_key, set()))
+        day["projects"] = sorted(live_projects.get(day_key, set()))
+    # Migrate archived days too: ambiguous inputs/prices cannot re-enter totals
+    # through the generic ledger/timeline fallback after source logs are gone.
+    for day_key, day in _load_ledger().get("tools", {}).get("copilot", {}).items():
+        if day_key in live_days or not isinstance(day, dict) or day.get("_ledger_version", 0) >= _COPILOT_PARSER_VERSION:
+            continue
+        legacy = day.get("_ledger_version", 0) < 5
+        for value in [day, *day.get("models", {}).values()]:
+            if legacy:
+                value["out"], value["reason"] = _copilot_output_tokens(value.get("out"), value.get("reason"))
+            for key in ("in", "cr", "cw", "cost", "cost_cny"):
+                value[key] = 0
+        day["_ledger_version"] = _COPILOT_PARSER_VERSION
+        _ledger_mark_dirty([day_key])
+    for day_key, day in ledger_reconcile("copilot", live_days).items():
+        try:
+            local_day = date.fromisoformat(day_key)
+        except (TypeError, ValueError):
+            continue
+        for range_key in classify_date(local_day, bounds):
+            _merge_token_day(B[range_key], day)
+            B[range_key]["sessions"].update(day.get("sessions") or live_sessions.get(day_key, set()))
+    if changed:
+        cache["_dirty"] = True
+    for bucket in B.values():
+        bucket["coverage"] = "output_only"
+    return {"ranges": B}
+
+
+# token total alias for consistency
+_copilot_token_total = token_total
+
+
+def _copilot_public_range(bucket):
+    # Publish the existing normalized schema with explicit partial coverage.
+    return {"coverage": "output_only", "in": 0, "cr": 0, "cw": 0,
+            "hit": 0, "cost": 0, "cost_cny": 0,
+            "out": bucket["out"], "reason": bucket["reason"],
+            "credits": bucket.get("credits", 0), "sessions": len(bucket["sessions"]),
+            "models": _format_token_models(bucket["models"], include_prices=False)}
+
+# aliases
+scan_copilot_cli = scan_copilot
+scan_github_copilot = scan_copilot
+scan_copilot_code = scan_copilot
+scan_copilot_usage = scan_copilot
+scan_github_copilot_cli = scan_copilot
+scan_copilotcli = scan_copilot
+
+
 def fmt_reset(epoch):
     try:
         return datetime.fromtimestamp(int(epoch)).astimezone().strftime("%m-%d %H:%M")
@@ -15295,6 +16697,7 @@ def compute(local_only=False):
     kimi = _safe_scan("kimicode", lambda: scan_kimicode(bounds, cache), _empty_kimicode, errors)
     muse = _safe_scan("musecode", lambda: scan_musecode(bounds, cache), _empty_musecode, errors)
     cmdcode = _safe_scan("cmdcode", lambda: scan_cmdcode(bounds, cache), _empty_cmdcode, errors)
+    copilot = _safe_scan("copilot", lambda: scan_copilot(bounds, cache), _empty_copilot, errors)
     _cache_dashboard_days(cache, _GEMINI_DAYS_CACHE_KEY, gm.get("days", {}))
     _cache_dashboard_days(cache, _GROK_DAYS_CACHE_KEY, gk.get("days", {}))
     if cache.pop("_pricing_changed", False):
@@ -15475,6 +16878,7 @@ def compute(local_only=False):
     museranges = {k: token_usage_range(muse["ranges"][k]) for k in RANGE_KEYS}
 
     cmdcranges = {k: token_usage_range(cmdcode["ranges"][k]) for k in RANGE_KEYS}
+    copilotranges = {k: _copilot_public_range(copilot["ranges"][k]) for k in RANGE_KEYS}
 
     cur = cc["cur"]
     cur_total = cur["in"] + cur["out"] + cur["cr"] + cur["cw"]
@@ -15634,10 +17038,20 @@ def compute(local_only=False):
         "cmdcode": {
             "ranges": cmdcranges,
         },
+        "copilot": {
+            "ranges": copilotranges,
+        },
+        "copilot_cli": {
+            "ranges": copilotranges,
+        },
+        "github_copilot": {
+            "ranges": copilotranges,
+        },
     }
     if errors:
         result["_errors"] = errors
     _recalc_costs(result)
+    _record_local_quota_readings(result)
     return result
 
 
@@ -15852,19 +17266,32 @@ def _write_configured_sync_snapshot(d):
     return _write_sync_snapshot(sync_dir, device_id, snapshot)
 
 
+def _pricing_metadata():
+    catalog = _load_json(PRICING_FILE, {})
+    verified = _load_json(OFFICIAL_PRICING_FILE, {})
+    meta = catalog.get("_meta") if isinstance(catalog, dict) else None
+    official = verified.get("_meta") if isinstance(verified, dict) else None
+    meta = meta if isinstance(meta, dict) else {}
+    official = official if isinstance(official, dict) else {}
+    return {"updated_at": meta.get("updated_at", ""), "count": meta.get("count", 0),
+            "official_source": official.get("source"),
+            "official_verified_at": official.get("verified_at"),
+            "official_count": official.get("count", 0)}
+
+
 def main_json():
     d = compute(local_only="--local-only" in sys.argv)
-    meta = _load_json(PRICING_FILE, {}).get("_meta", {})
-    d["_pricing"] = {"updated_at": meta.get("updated_at", ""), "count": meta.get("count", 0)}
+    d["_pricing"] = _pricing_metadata()
     print(json.dumps(d, ensure_ascii=False))
     if "--no-sync-snapshot" not in sys.argv:
         _write_configured_sync_snapshot(d)
+    if "--local-only" not in sys.argv:
+        _schedule_pricing_refresh(d)
 
 
 def write_sync_snapshot():
     d = compute()
-    meta = _load_json(PRICING_FILE, {}).get("_meta", {})
-    d["_pricing"] = {"updated_at": meta.get("updated_at", ""), "count": meta.get("count", 0)}
+    d["_pricing"] = _pricing_metadata()
     # 账本随快照进同步仓:异地备份,本地账本丢失时可自愈恢复
     ledger = _load_ledger()
     if ledger.get("tools"):
@@ -15878,6 +17305,7 @@ def write_sync_snapshot():
 
 def main():
     d = compute()
+    _schedule_pricing_refresh(d)
     c, x = d["claude"], d["codex"]
     ct = c["ranges"]["today"]
     xt = x["ranges"]["today"]
@@ -16097,25 +17525,35 @@ def _record_pricing_changes(models):
     _with_scan_cache_lock(mark)()
 
 
-def update_prices():
-    """显式联网:拉 OpenRouter /api/v1/models,刷新 pricing.json(不动 overrides)。"""
+def _update_catalog_prices():
+    """更新公开目录；本地覆盖与已核实的官方价独立保存。"""
     import urllib.request
     try:
         with urllib.request.urlopen("https://openrouter.ai/api/v1/models", timeout=30) as r:
-            data = json.load(r)["data"]
+            raw = r.read(10 * 1024 * 1024 + 1)
+            if len(raw) > 10 * 1024 * 1024:
+                raise ValueError("pricing catalog is too large")
+            data = json.loads(raw)["data"]
+            if not isinstance(data, list) or not data:
+                raise ValueError("empty pricing catalog")
     except Exception as e:
         print(f"更新失败:{e}", file=sys.stderr)
         return 1
 
     def mtok(pr, k):
         try:
-            return round(float(pr.get(k) or 0) * 1e6, 6)
+            value = round(float(pr.get(k) or 0) * 1e6, 6)
+            return value if _valid_price_number(value) else 0.0
         except (TypeError, ValueError):
             return 0.0
 
     models = {}
     for m in data:
+        if not isinstance(m, dict) or not isinstance(m.get("id"), str):
+            continue
         pr = m.get("pricing") or {}
+        if not isinstance(pr, dict):
+            continue
         if not mtok(pr, "prompt") and not mtok(pr, "completion"):
             continue                              # 跳过无价(免费/路由占位)条目
         entry = {"in": mtok(pr, "prompt"), "out": mtok(pr, "completion"),
@@ -16126,6 +17564,9 @@ def update_prices():
             if isinstance(value, str) and value.strip():
                 entry[field] = value.strip()
         models[m["id"]] = entry
+    if not models:
+        print("更新失败:目录中没有有效价格", file=sys.stderr)
+        return 1
     active_count = len(models)
     old_models = _load_json(PRICING_FILE, {}).get("models", {})
     retained_count = 0
@@ -16149,12 +17590,258 @@ def update_prices():
                          "active_count": active_count,
                          "retained_count": retained_count},
                "models": models}
-    with open(PRICING_FILE, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=1, sort_keys=True)
+    _atomic_write_json(PRICING_FILE, payload)
     _record_pricing_changes(changed_models)
     suffix = f"，保留 {retained_count} 个历史模型" if retained_count else ""
     print(f"已更新 {active_count} 个在线模型{suffix} → {PRICING_FILE}")
     return 0
+
+
+def _parse_openai_prices(markdown):
+    """只读取官方 Standard 表，避免混入 Batch / Fast 的折扣或倍数。"""
+    start = markdown.find("### Standard pricing data")
+    end = markdown.find("### Batch pricing data", start)
+    if start < 0 or end < 0:
+        raise ValueError("OpenAI Standard pricing section not found")
+    if not re.search(r"Prices per (?:1M|1,000,000) tokens", markdown[:start], re.IGNORECASE):
+        raise ValueError("OpenAI pricing unit is not per million tokens")
+    threshold_match = re.search(r"Short context:\s*≤\s*([\d.]+)\s*([KM]?)\s+input tokens", markdown)
+    threshold = (int(float(threshold_match[1]) * {"": 1, "K": 1000, "M": 1_000_000}[threshold_match[2]])
+                 if threshold_match else None)
+    headers, models = [], {}
+
+    def dollars(value):
+        match = re.fullmatch(r"\$([\d,]+(?:\.\d+)?)", value.strip())
+        if not match:
+            return None
+        price = float(match[1].replace(",", ""))
+        return price if _valid_price_number(price) else None
+
+    for line in markdown[start:end].splitlines():
+        if not line.strip().startswith("|"):
+            continue
+        cells = [cell.strip().strip("`") for cell in line.strip().strip("|").split("|")]
+        if cells[0].lower() == "model":
+            headers = [re.sub(r"[^a-z0-9]", "", cell.lower()) for cell in cells]
+            continue
+        if not headers or len(headers) != len(cells):
+            continue
+        model = re.fullmatch(r"((?:gpt-\d|o\d)[a-z0-9.-]*)(?:\s+\([^|]+\))?", cells[0])
+        if not model:
+            continue
+        values = dict(zip(headers, cells))
+        long_table = "shortcontextinput" in values
+        prefix = "shortcontext" if long_table else ""
+        pin, pout = dollars(values.get(prefix + "input", "")), dollars(values.get(prefix + "output", ""))
+        if pin is None or pout is None or pin <= 0 or pout <= 0:
+            continue
+        cache_cell = values.get(prefix + "cachedinput", "")
+        cache_read = 0.0 if cache_cell in ("-", "—") else dollars(cache_cell)
+        write_cell = values.get(prefix + "30mwrite", "-")
+        cache_write = 0.0 if write_cell in ("-", "—") else dollars(write_cell)
+        if cache_read is None or cache_write is None:
+            continue
+        price = {"in": pin, "out": pout,
+                 "cache_read": cache_read, "cache_write": cache_write}
+        if long_table and dollars(values.get("longcontextinput", "")) is not None:
+            if threshold is None or not 0 < threshold <= 10_000_000:
+                raise ValueError("OpenAI long-context threshold not found")
+            long_out = dollars(values.get("longcontextoutput", ""))
+            long_cache_cell = values.get("longcontextcachedinput", "")
+            long_cache = 0.0 if long_cache_cell in ("-", "—") else dollars(long_cache_cell)
+            if long_out is None or long_out <= 0 or long_cache is None:
+                continue
+            price["long_context"] = {
+                "threshold": threshold, "in": dollars(values["longcontextinput"]), "out": long_out,
+                "cache_read": long_cache,
+            }
+        models["openai/" + model[1]] = price
+    if len(models) < 3:
+        raise ValueError("OpenAI pricing table is incomplete")
+    return models
+
+
+def _fetch_openai_prices():
+    import urllib.request
+    from urllib.parse import urlsplit
+    request = urllib.request.Request(_OPENAI_PRICING_URL, headers={
+        "User-Agent": "Tokei/1.0 (public pricing check)", "Accept": "text/markdown"})
+    with urllib.request.urlopen(request, timeout=20) as response:
+        if urlsplit(response.geturl()).hostname != "developers.openai.com":
+            raise ValueError("unexpected pricing source redirect")
+        raw = response.read(2 * 1024 * 1024 + 1)
+    if len(raw) > 2 * 1024 * 1024:
+        raise ValueError("official pricing page is too large")
+    return _parse_openai_prices(raw.decode("utf-8"))
+
+
+def _update_openai_prices():
+    fetched = _fetch_openai_prices()
+    if not fetched:
+        raise ValueError("empty official pricing table")
+    now = int(_time.time())
+    old = _load_official_pricing()
+    models = dict(old)
+    for model, price in fetched.items():
+        models[model] = dict(price, source=_OPENAI_PRICING_URL, verified_at=now)
+    overrides, _ = _merge_pricing_overrides(_OVERRIDES, official=models)
+    effective = _effective_pricing_map(overrides=overrides, official=models)
+    changed = {model for model in set(_PRICING_EFFECTIVE) | set(effective)
+               if _PRICING_EFFECTIVE.get(model) != effective.get(model)}
+    _atomic_write_json(OFFICIAL_PRICING_FILE, {
+        "_meta": {"source": _OPENAI_PRICING_URL, "verified_at": now, "count": len(fetched)},
+        "models": models})
+    _record_pricing_changes(changed)
+    print(f"已核对 {len(fetched)} 个 OpenAI 官方模型价格")
+
+
+_PRICING_REFRESH_INTERVAL = 24 * 3600
+_PRICING_RETRY_INTERVAL = 3600
+_PRICING_NEW_MODEL_INTERVAL = 300
+
+
+def _pricing_refresh_due(state, unknown=(), now=None):
+    now = _time.time() if now is None else now
+    state = state if isinstance(state, dict) else {}
+
+    def recent(value, ttl):
+        return (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and math.isfinite(value) and -300 <= now - value < ttl)
+
+    if recent(state.get("last_attempt"), _PRICING_NEW_MODEL_INTERVAL):
+        return False
+    if state.get("errors") and recent(state.get("last_attempt"), _PRICING_RETRY_INTERVAL):
+        return False
+    if any(not recent(state.get(key), _PRICING_REFRESH_INTERVAL)
+           for key in ("catalog_checked_at", "openai_checked_at")):
+        return True
+    if not _OFFICIAL_PRICING_DB:
+        return True
+    signature = hashlib.sha256("\n".join(sorted(unknown)).encode()).hexdigest()
+    if state.get("unknown_signature") == signature:
+        return False
+    return bool(set(unknown) - set(state.get("checked_models") or []))
+
+
+def _pricing_update_lock():
+    """价格下载使用独立的非阻塞锁，避免拖慢用量扫描。"""
+    path = PRICING_UPDATE_STATE + ".lock"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        if _IS_WINDOWS:
+            import msvcrt
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b"\0")
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+    except OSError:
+        os.close(fd)
+        return None
+
+
+def update_prices(auto=False):
+    global PRICING_FILE
+    if auto:
+        # 开发目录里的脚本也只更新用户缓存，不改 Git 跟踪的发布基准价目表。
+        PRICING_FILE = os.path.join(_USER_DIR, "pricing.json")
+    fd = _pricing_update_lock()
+    if auto:
+        # 父进程写完排队状态才释放锁；后台进程允许短暂等它，界面不等待。
+        for _ in range(20):
+            if fd is not None:
+                break
+            _time.sleep(0.05)
+            fd = _pricing_update_lock()
+    if fd is None:
+        print("价格核对已在后台进行")
+        return 0
+    try:
+        state = _load_json(PRICING_UPDATE_STATE, {})
+        state = state if isinstance(state, dict) else {}
+        pending = state.pop("pending_models", [])
+        if auto and not _pricing_refresh_due(state, pending):
+            state["scheduled_at"] = 0
+            _atomic_write_json(PRICING_UPDATE_STATE, state)
+            return 0
+        state.update(last_attempt=int(_time.time()), scheduled_at=0, errors=[])
+        _atomic_write_json(PRICING_UPDATE_STATE, state)
+        success = False
+        for source, update in (("catalog", _update_catalog_prices), ("openai", _update_openai_prices)):
+            try:
+                if update() not in (None, 0):
+                    raise ValueError("source update failed")
+                state[source + "_checked_at"] = int(_time.time())
+                success = True
+            except Exception as error:
+                state["errors"].append(source)
+                print(f"{source} 价格核对失败，保留已有价格: {type(error).__name__}", file=sys.stderr)
+        state["checked_models"] = sorted(set(state.get("checked_models") or []) | set(pending))[-256:]
+        state["unknown_signature"] = hashlib.sha256("\n".join(sorted(pending)).encode()).hexdigest()
+        _atomic_write_json(PRICING_UPDATE_STATE, state)
+        return 0 if success else 1
+    finally:
+        _unlock_file(fd)
+        os.close(fd)
+
+
+def _schedule_pricing_refresh(usage):
+    """完整采集结束后后台核价，两端共用；本地预览不联网，不等下载。"""
+    try:
+        return _start_pricing_refresh(usage)
+    except (OSError, TypeError, ValueError):
+        return False   # 核价状态写不了也不影响用量结果和首屏。
+
+
+def _start_pricing_refresh(usage):
+    if os.environ.get("TOKEI_AUTO_PRICING", "").lower() in ("0", "false", "off"):
+        return False
+    config = _load_json(os.path.join(_USER_DIR, "config.json"), {})
+    if isinstance(config, dict) and config.get("auto_pricing_enabled") is False:
+        return False
+    unknown = set()
+    for tool in usage.values():
+        if not isinstance(tool, dict):
+            continue
+        ranges = tool.get("ranges")
+        today = ranges.get("today") if isinstance(ranges, dict) else None
+        for model in (today.get("models") or []) if isinstance(today, dict) else []:
+            if not isinstance(model, dict):
+                continue
+            name = model.get("model_id") or model.get("name")
+            if isinstance(name, str) and not _is_exact_match(name):
+                unknown.add(hashlib.sha256(name.lower().encode()).hexdigest())
+    state = _load_json(PRICING_UPDATE_STATE, {})
+    if not _pricing_refresh_due(state, unknown):
+        return False
+    fd = _pricing_update_lock()
+    if fd is None:
+        return False
+    try:
+        state = _load_json(PRICING_UPDATE_STATE, {})
+        state = state if isinstance(state, dict) else {}
+        now = _time.time()
+        scheduled = state.get("scheduled_at", 0)
+        if (isinstance(scheduled, (int, float)) and -300 <= now - scheduled < 600
+                or not _pricing_refresh_due(state, unknown, now)):
+            return False
+        process = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--auto-update-prices"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            close_fds=True, start_new_session=not _IS_WINDOWS, **_NO_WINDOW)
+        _atomic_write_json(PRICING_UPDATE_STATE, dict(state, scheduled_at=now,
+            pending_models=sorted(unknown), pid=process.pid))
+        return True
+    except OSError:
+        _atomic_write_json(PRICING_UPDATE_STATE, dict(state, last_attempt=int(_time.time()),
+                                                    scheduled_at=0, errors=["launch"]))
+        return False
+    finally:
+        _unlock_file(fd)
+        os.close(fd)
 
 
 def _scan_local_models():
@@ -16801,7 +18488,7 @@ def build_daily_costs(period="all", refresh=True, _cache=None):
         "claude", "codex", "codex_reserve", "gemini", "grok", "hermes", "openclaw", "zcode",
         "mimocode", "devin", "minimax", "pi", "workbuddy", "workbuddy_ai", "codebuddy",
         "deepseek_harness",
-        "opencode", "qwencode", "musecode", "cmdcode"))
+        "opencode", "qwencode", "musecode", "cmdcode", "copilot"))
     for tool, tool_days in _load_ledger().get("tools", {}).items():
         if not isinstance(tool_days, dict):
             continue
@@ -17562,8 +19249,8 @@ def _load_dashboard_cache():
     return cache
 
 
-# ---------- 周额度消耗 ----------
-# 一个周期 = 两次「余量 100%」之间,起点取 resets_at - 7天。
+# ---------- 额度周期消耗 ----------
+# 一个周期 = 两次「余量 100%」之间,起点取 resets_at 往前一周或一个日历月。
 # 实测:resets_at 会不定期重锚(观测到的间隔有 0.75 / 2.1 / 7.0 天),所以历史边界
 # 推不出来,只能观测一次记一次 —— 见 _QUOTA_ANCHOR_FILE。
 # 周期边界落在半天,日级账本切不出来,所以整日部分取账本(权威,不受 CLI 清理旧日志
@@ -17573,10 +19260,11 @@ _QUOTA_CYCLE_HISTORY = 52
 _QUOTA_WEEK_HOURS = 7 * 24
 _QUOTA_SELF_DEVICE = "本机"
 _QUOTA_ANCHOR_FILE = os.path.join(HOME, ".tokei", "quota_cycles.json")
+_QUOTA_HISTORY_FILE = os.path.join(HOME, ".tokei", "quota_history.json")
 # resets_in_seconds 是整秒截断的,同一个锚点读出来会有几秒抖动。
 _QUOTA_ANCHOR_JITTER = 120
 _QUOTA_CYCLE_MIN_USED_PCT = 2
-# 有周额度窗口的三个工具 → 日表里的短键。
+# 有额度周期的三个工具 → 日表里的短键。
 _QUOTA_TOOLS = (("claude", "c"), ("codex", "x"), ("grok", "g"))
 
 
@@ -17684,7 +19372,7 @@ def _quota_day_hour_bounds(day_key, start, end):
 
 
 def _quota_claude_events(cache=None):
-    """去重后的 Claude 事件 → [(epoch, 本地日, tokens)]。去重逻辑与 scan_claude 一致。"""
+    """去重后的 Claude 事件 → [(epoch, 本地日, tokens, cost)]。去重同 scan_claude。"""
     file_cache = (cache if cache is not None else _load_scan_cache()).get("claude") or {}
     all_events = []
     for path, entry in file_cache.items():
@@ -17698,7 +19386,7 @@ def _quota_claude_events(cache=None):
             continue
         dt = dt.astimezone()
         events.append((int(dt.timestamp()), dt.date().isoformat(),
-                       _claude_event_total(event)))
+                       _claude_event_total(event), _quota_cost_value(event.get("cost"))))
     return events
 
 
@@ -17733,8 +19421,12 @@ def _quota_codex_events(spans, cache=None):
                 dt = parse_ts(row[0])
                 if dt is None:
                     continue
+                # The main Codex day ledger excludes Reserve; keep its events out too.
+                if len(row) > 11 and _codex_is_reserve_model(row[11]):
+                    continue
                 events.append((int(dt.timestamp()), str(row[1]),
-                               int(row[6] or 0) + int(row[8] or 0)))
+                               int(row[6] or 0) + int(row[8] or 0),
+                               _quota_cost_value(row[10]) if len(row) > 10 else None))
         except (OSError, ValueError):
             continue
     return events
@@ -17750,38 +19442,104 @@ def _quota_peer_boundary(tools, tool, day_key, bounds, day_total):
     return day_total * (hi_hour - lo_hour) // 24, True
 
 
+def _quota_cost_value(value):
+    """Only finite, nonnegative costs can enter a public JSON payload."""
+    if isinstance(value, bool):
+        return None
+    try:
+        amount = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return amount if math.isfinite(amount) and amount >= 0 else None
+
+
+def _quota_day_cost(tools, tool, day_key):
+    entry = (tools.get(tool) or {}).get(day_key)
+    if not isinstance(entry, dict):
+        return None
+    return _quota_cost_value(entry.get("cost"))
+
+
 def _quota_window_tokens(devices, tool, key, start, end, self_events):
-    """→ (合计, {设备: token}, 是否含折算值)。self_events 为 None 时本机也走 hours。"""
+    """Return (tokens, per-device tokens, token approximation, optional USD estimate).
+
+    Full days use the retained ledger. A partial local day uses cached request
+    costs only when its complete token/cost coverage agrees with that ledger.
+    Missing, legacy, or differently priced events fall back to day cost weighted
+    by selected tokens; peers and Grok use that same explicitly estimated path.
+    """
     interior, boundary = _quota_window_days(start, end)
-    self_by_day = {}
-    for ts, day, amount in self_events or ():
+    self_by_day, self_day_totals = {}, {}
+    self_cost_by_day, self_day_costs = {}, {}
+    missing_cost = set()
+    boundary_days = set(boundary)
+    for event in self_events or ():
+        day = event[1]
+        if day not in boundary_days:
+            continue
+        ts, amount = event[0], event[2]
+        self_day_totals[day] = self_day_totals.get(day, 0) + amount
+        event_cost = _quota_cost_value(event[3]) if len(event) > 3 else None
+        if event_cost is None:
+            missing_cost.add(day)
+        else:
+            self_day_costs[day] = self_day_costs.get(day, 0.0) + event_cost
         if start <= ts < end and day not in interior:
             self_by_day[day] = self_by_day.get(day, 0) + amount
+            if event_cost is not None:
+                self_cost_by_day[day] = self_cost_by_day.get(day, 0.0) + event_cost
 
     per_device = {}
     approx = False
+    cost = 0.0
+    cost_known = True
     for name, tools, _snapshot, daily in devices:
         own = name == _QUOTA_SELF_DEVICE and self_events is not None
         total = sum(int((daily.get(day) or {}).get(key, 0)) for day in interior)
+        for day in interior:
+            if int((daily.get(day) or {}).get(key, 0)) <= 0:
+                continue
+            day_cost = _quota_day_cost(tools, tool, day)
+            if day_cost is None:
+                cost_known = False
+            else:
+                cost += day_cost
         for day in boundary:
             bounds = _quota_day_hour_bounds(day, start, end)
             if bounds is None:
                 continue
             day_total = int((daily.get(day) or {}).get(key, 0))
-            # 事件有就用事件(最准);事件空但账本当天有量 = 日志被清理过,退回折算。
-            if own and (self_by_day.get(day) or not day_total):
-                total += self_by_day.get(day, 0)
-                continue
-            amount, guessed = _quota_peer_boundary(tools, tool, day, bounds, day_total)
+            complete_tokens = own and self_day_totals.get(day, 0) == day_total
+            # Complete events can prove an empty subhour window. An incomplete
+            # cache still follows the retained token/hour fallback behavior.
+            if own and (self_by_day.get(day) or not day_total or complete_tokens):
+                amount = self_by_day.get(day, 0)
+            else:
+                amount, guessed = _quota_peer_boundary(tools, tool, day, bounds, day_total)
+                approx = approx or (guessed and amount > 0)
             total += amount
-            approx = approx or (guessed and amount > 0)
+            if day_total > 0 and amount > 0:
+                day_cost = _quota_day_cost(tools, tool, day)
+                if day_cost is None:
+                    cost_known = False
+                    continue
+                complete_cost = (complete_tokens and day not in missing_cost
+                                 and math.isclose(self_day_costs.get(day, 0), day_cost,
+                                                  rel_tol=1e-9, abs_tol=0.0001))
+                if complete_cost and 0 < amount < day_total:
+                    cost += self_cost_by_day.get(day, 0.0)
+                else:
+                    cost += day_cost * max(0.0, min(amount / day_total, 1.0))
         per_device[name] = total
-    return sum(per_device.values()), per_device, approx
+    # Unknown or invalid amounts remain absent, rather than suggesting free usage.
+    final_cost = round(cost, 4) if cost_known and math.isfinite(cost) else None
+    return sum(per_device.values()), per_device, approx, final_cost
 
 
 def _quota_tool_reading(source, tool):
-    """从一份 payload/同步快照里取 (used_pct, reset_epoch, 读数时间);取不到返回 None。"""
+    """从一份 payload/同步快照里取 (used_pct, reset_epoch, 读数时间, window);取不到返回 None。"""
     data = (source or {}).get(tool) or {}
+    window = "week"
     if tool == "claude":
         if data.get("q7_stale"):
             return None
@@ -17791,15 +19549,15 @@ def _quota_tool_reading(source, tool):
             return None
         used, reset, updated = data.get("pw"), data.get("rw"), data.get("q_updated")
     else:
-        # Grok 也可能是月套餐,月窗口长度不定又没有数据可验证,先只认周。
-        if data.get("stale") or data.get("window") != "week":
+        window = data.get("window")
+        if data.get("stale") or window not in ("week", "month"):
             return None
         used, reset, updated = data.get("pct"), data.get("reset"), data.get("q_updated")
     if not isinstance(reset, (int, float)):
         reset = _iso_to_epoch(reset)
     if not isinstance(reset, (int, float)) or reset <= 0:
         return None
-    return used, int(reset), int(updated or 0)
+    return used, int(reset), int(updated or 0), window
 
 
 def _load_quota_anchors():
@@ -17829,13 +19587,49 @@ def _save_quota_anchors(anchors):
                 pass
 
 
-def _record_quota_anchor(anchors, tool, reset, used, now, confirmed_reset=False):
+_QUOTA_ANCHOR_LOCK = threading.Lock()
+
+
+def _with_quota_anchor_lock(fn):
+    def locked(*args, **kwargs):
+        # 主刷新和详情采集会同时更新同一份历史；线程和独立进程都必须串行读改写。
+        with _QUOTA_ANCHOR_LOCK:
+            lock_path = _QUOTA_ANCHOR_FILE + ".lock"
+            os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                _lock_file(fd)
+                try:
+                    return fn(*args, **kwargs)
+                finally:
+                    _unlock_file(fd)
+            finally:
+                os.close(fd)
+    return locked
+
+
+@_with_quota_anchor_lock
+def _record_local_quota_readings(payload, now=None):
+    """每次主刷新都保存周期读数，详情页关着时也能记住耗尽和回满。"""
+    now = int(datetime.now().timestamp()) if now is None else now
+    anchors = _load_quota_anchors()
+    dirty = False
+    for tool, _key in _QUOTA_TOOLS:
+        reading = _quota_tool_reading(payload, tool)
+        if reading:
+            dirty |= _record_quota_anchor(anchors, tool, reading[1], reading[0], now, window=reading[3])
+    if dirty:
+        _save_quota_anchors(anchors)
+
+
+def _record_quota_anchor(anchors, tool, reset, used, now, confirmed_reset=False, window="week"):
     """记下一次额度读数。同一个锚点只留一条,used 取见过的最大值。
 
     额度从有消耗的旧窗口回到 0%,同时 reset 前移到新窗口,已经足以确认提前重置。
     后续空闲时 reset 继续漂移不会连开新周期:只有紧邻的上一锚点有真实消耗时
     才确认这次 0% 重置。
     """
+    window = window if window in ("week", "month") else "week"
     used = float(used or 0)
     rows = anchors.setdefault(tool, [])
     previous = [
@@ -17850,18 +19644,22 @@ def _record_quota_anchor(anchors, tool, reset, used, now, confirmed_reset=False)
          latest_previous.get("max_used", 0) >= _QUOTA_CYCLE_MIN_USED_PCT)
     )
     for row in rows:
-        if abs(int(row.get("reset", 0)) - reset) <= _QUOTA_ANCHOR_JITTER:
+        if (row.get("window", "week") == window and
+                abs(int(row.get("reset", 0)) - reset) <= _QUOTA_ANCHOR_JITTER):
             changed = (
+                row.get("window") != window or
                 used > row.get("max_used", 0) or
                 now > row.get("last_seen", 0) or
                 (confirmed_reset and not row.get("confirmed_reset"))
             )
+            row["window"] = window
             row["max_used"] = max(row.get("max_used", 0), used)
             row["last_seen"] = max(row.get("last_seen", 0), now)
             if confirmed_reset:
                 row["confirmed_reset"] = True
             return changed
-    row = {"reset": reset, "first_seen": now, "last_seen": now, "max_used": used}
+    row = {"reset": reset, "first_seen": now, "last_seen": now, "max_used": used,
+           "window": window}
     if confirmed_reset:
         row["confirmed_reset"] = True
     rows.append(row)
@@ -17889,18 +19687,29 @@ def _merge_quota_anchors(anchors, incoming):
                 anchors, tool, int(reset),
                 used if isinstance(used, (int, float)) else 0,
                 int(seen) if isinstance(seen, (int, float)) else 0,
-                confirmed_reset=row.get("confirmed_reset") is True)
+                confirmed_reset=row.get("confirmed_reset") is True,
+                window=row.get("window", "week") if row.get("window") in ("week", "month") else "week")
     return anchors
 
 
-def _quota_anchor_cycles(anchors, tool, span, limit, now):
-    """→ [(start, end, max_used, 是否进行中)]，最新的排最前。
+def _quota_cycle_start(reset, window="week"):
+    """按窗口回推起点:月窗口保留本地时刻,超出上个月的日子取月末。"""
+    if window != "month":
+        return reset - _QUOTA_WEEK_HOURS * 3600
+    local = datetime.fromtimestamp(reset)
+    year, month = (local.year, local.month - 1) if local.month > 1 else (local.year - 1, 12)
+    day = min(local.day, calendar.monthrange(year, month)[1])
+    return int(local.replace(year=year, month=month, day=day).timestamp())
+
+
+def _quota_anchor_cycles(anchors, tool, limit, now):
+    """→ [(start, end, max_used, 是否进行中, window)]，最新的排最前。
 
     按 reset 排序而不是按观测顺序:陈旧的会话记录偶尔会抢赢新记录,
     照观测顺序切会切出负时长的区间。排序后每段时长天然为正。
     """
     rows = sorted(anchors.get(tool) or [], key=lambda r: int(r.get("reset", 0)))
-    # 窗口空着的时候 reset 会一直跟着 now+7d 漂,那不是真周期。真实消耗和
+    # 窗口空着的时候 reset 会一直跟着当前时间往后漂,那不是真周期。真实消耗和
     # 「旧窗口有消耗后回到 0%」两种证据都能确认周期;没有证据时只展示最新读数。
     rows = [
         row for row in rows
@@ -17908,22 +19717,87 @@ def _quota_anchor_cycles(anchors, tool, span, limit, now):
         row.get("confirmed_reset") is True
     ] or rows[-1:]
 
+    # 月末账单日会被短月截到月底;相邻月锚点足够接近时,沿用实际重置边界。
+    starts = []
+    for index, row in enumerate(rows):
+        start = _quota_cycle_start(int(row["reset"]), row.get("window", "week"))
+        if index > 0 and row.get("window") == "month":
+            previous = rows[index - 1]
+            previous_reset = int(previous["reset"])
+            if previous.get("window") == "month" and abs(previous_reset - start) <= 3 * 86400:
+                start = previous_reset
+        starts.append(start)
+
     cycles = []
     for index, row in enumerate(rows):
         reset = int(row["reset"])
-        start = reset - span
+        window = "month" if row.get("window") == "month" else "week"
+        start = starts[index]
         if index + 1 < len(rows):
-            end = min(reset, int(rows[index + 1]["reset"]) - span)
+            end = min(reset, starts[index + 1])
         else:
             end = reset
         if end > start:
             # 读数断了就不会再有新锚点,最后一条也可能早已过期 —— 那是历史,不是进行中。
             # 但「进行中」仍只能是最后一条:多标一条会被前端当成当前卡片,另一条就没了。
             current = index + 1 == len(rows) and reset > now
-            cycles.append((start, end, row.get("max_used", 0), current))
+            cycles.append((start, end, row.get("max_used", 0), current, window))
     return cycles[-limit:][::-1]
 
 
+def _load_quota_history_points():
+    try:
+        with open(_QUOTA_HISTORY_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and data.get("version") == 1 and isinstance(data.get("points"), list):
+            return data["points"]
+    except (OSError, ValueError):
+        pass
+    return []
+
+
+def _reconcile_quota_anchor_peaks(anchors, boundaries, now):
+    """用已有分钟快照补齐漏采的历史峰值，只抬高已知周期，不推测缺失读数。"""
+    points = _load_quota_history_points()
+    if not points:
+        return False
+    span = _QUOTA_WEEK_HOURS * 3600
+    fields = {"claude": "claudeWeekRemaining", "codex": "codexWeekRemaining"}
+    dirty = False
+    for tool, field in fields.items():
+        samples = []
+        for point in points:
+            if not isinstance(point, dict):
+                continue
+            timestamp, remaining = point.get("timestamp"), point.get(field)
+            if (type(timestamp) not in (int, float) or not math.isfinite(timestamp)
+                    or type(remaining) not in (int, float) or not math.isfinite(remaining)
+                    or not 0 <= remaining <= 100):
+                continue
+            samples.append((timestamp, 100 - remaining))
+        for start, end, _used, _current, window in _quota_anchor_cycles(
+                boundaries, tool, _QUOTA_CYCLE_HISTORY, now):
+            if window != "week":
+                continue
+            reset = start + span
+            # peer 提供边界可避免跨周期归错；只补本机已有的锚点，不把 peer 的账回写。
+            own = next((row for row in anchors.get(tool, [])
+                        if abs(int(row["reset"]) - reset) <= _QUOTA_ANCHOR_JITTER), None)
+            if own is None:
+                continue
+            observed = [(timestamp, used) for timestamp, used in samples
+                        if start <= timestamp < min(end, now + 1)]
+            if not observed:
+                continue
+            peak = max(used for _timestamp, used in observed)
+            if peak > own.get("max_used", 0):
+                own["max_used"] = peak
+                own["last_seen"] = max(own.get("last_seen", 0), max(t for t, _u in observed))
+                dirty = True
+    return dirty
+
+
+@_with_quota_anchor_lock
 def _quota_cycle_specs(payload, devices, peer_anchors, now):
     """→ (能切出周期的工具, 一条锚点都没有的工具, 锚点表)，顺便把这次读到的锚点落盘。
 
@@ -17939,7 +19813,12 @@ def _quota_cycle_specs(payload, devices, peer_anchors, now):
         for _name, _tools, snapshot, _daily in devices:
             reading = _quota_tool_reading(snapshot if snapshot else payload, tool)
             if reading:
-                dirty |= _record_quota_anchor(anchors, tool, reading[1], reading[0], now)
+                dirty |= _record_quota_anchor(anchors, tool, reading[1], reading[0], now,
+                                              window=reading[3])
+    boundaries = {tool: [dict(row) for row in rows] for tool, rows in anchors.items()}
+    for incoming in peer_anchors:
+        _merge_quota_anchors(boundaries, incoming)
+    dirty |= _reconcile_quota_anchor_peaks(anchors, boundaries, now)
     if dirty:
         _save_quota_anchors(anchors)
     for incoming in peer_anchors:
@@ -17984,33 +19863,34 @@ def build_quota_detail():
     payload, cache = _quota_detail_inputs()
     now = int(datetime.now().timestamp())
     devices, peer_anchors = _quota_device_ledgers()
-    span = _QUOTA_WEEK_HOURS * 3600
     charted, missing, anchors = _quota_cycle_specs(payload, devices, peer_anchors, now)
 
     planned = []
     for tool in charted:
-        for start, end, used, current in _quota_anchor_cycles(
-                anchors, tool, span, _QUOTA_CYCLE_HISTORY, now):
-            planned.append((tool, start, end, used, current))
+        for start, end, used, current, window in _quota_anchor_cycles(
+                anchors, tool, _QUOTA_CYCLE_HISTORY, now):
+            planned.append((tool, start, end, used, current, window))
 
-    codex_spans = [(s, e) for tool, s, e, _u, _c in planned if tool == "codex"]
+    codex_spans = [(s, e) for tool, s, e, _u, _c, _w in planned if tool == "codex"]
     keys = dict(_QUOTA_TOOLS)
     events = {}
     cycles = []
-    for tool, start, end, used, current in planned:
+    for tool, start, end, used, current, window in planned:
         if tool not in events:
             # Grok 没有带时间戳的事件缓存,只能靠账本的 hours。
             events[tool] = (_quota_claude_events(cache) if tool == "claude"
                             else _quota_codex_events(codex_spans, cache) if tool == "codex"
                             else None)
-        tokens, per_device, approx = _quota_window_tokens(
+        tokens, per_device, approx, cost = _quota_window_tokens(
             devices, tool, keys[tool], start, end, events[tool])
         cycles.append({
             "tool": tool,
+            "window": window,
             "start": start,
             "end": end,
             "used_pct": used,
             "tokens": tokens,
+            "cost": cost,
             "devices": per_device,
             "approx": approx,
             "current": current,
@@ -18078,6 +19958,7 @@ _PROJECT_SOURCES = (
 # 一文件一会话的工具用上面 _PROJECT_SOURCES 的形状，两种都走同一个贡献流。
 _PROJECT_DAY_SOURCES = (
     # tool_key,  显示名
+    ("copilot",  "GitHub Copilot"),
     ("devin",    "Devin"),
     ("minimax",  "MiniMax Code"),
     ("hermes",   "Hermes"),
@@ -18153,7 +20034,8 @@ def _project_contributions(cache):
         for entry in tool_cache.values():
             if not isinstance(entry, dict):
                 continue
-            for day_key, day in (entry.get("days") or {}).items():
+            for day_key, day in ((entry.get("canonical_days") if tool_key == "copilot"
+                                  else entry.get("days")) or {}).items():
                 if not isinstance(day, dict):
                     continue
                 by_project = day.get("projects")
@@ -18332,6 +20214,8 @@ if __name__ == "__main__":
         for _stream in (sys.stdout, sys.stderr):
             if hasattr(_stream, "reconfigure"):
                 _stream.reconfigure(encoding="utf-8", errors="replace")
+    if "--auto-update-prices" in sys.argv:
+        sys.exit(update_prices(auto=True))
     if "--update-prices" in sys.argv:
         sys.exit(update_prices())
     if "--update-unknown" in sys.argv:

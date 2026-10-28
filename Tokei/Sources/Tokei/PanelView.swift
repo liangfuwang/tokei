@@ -5,6 +5,7 @@ import TokeiUpdateSecurity
 struct PanelView: View {
     @ObservedObject var store: Store
     @ObservedObject var layout: PanelLayoutContext = PanelLayoutContext()
+    @ObservedObject private var cycleDetail = QuotaDetailRepository.shared
     var scrollable = true
     /// 一次性量尺寸的 probe 从哪个页签画起；平时的面板总是从「今日」开始。
     static var initialRange: RangeKey = .today
@@ -88,6 +89,7 @@ struct PanelView: View {
     @AppStorage("showKimiCode") private var showKimiCode = true
     @AppStorage("showMuseCode") private var showMuseCode = true
     @AppStorage("showCmdCode") private var showCmdCode = true
+    @AppStorage("showCopilot") private var showCopilot = true
     @AppStorage("showDevin") private var showDevin = true
     @AppStorage("showMiniMax") private var showMiniMax = true
     /// 默认关闭：Grok 额度只读本地日志；开启后才用登录凭据请求实时账单接口。
@@ -116,7 +118,9 @@ struct PanelView: View {
 
     private var toolVisibility: UsageToolVisibility {
         UsageToolVisibility(
-            claude: showClaude, codex: showCodex, gemini: showGemini, grok: showGrok,
+            claude: showClaude, codex: showCodex, gemini: showGemini,
+            cursor: showCursor, zed: showZed, sub2api: showSub2API, zai: showZai,
+            grok: showGrok,
             grokBot: showGrokBot,
             qoder: showQoder, qoderwork: showQoderWork, qodercli: showQoderCli,
             qodercliCN: showQoderCliCN,
@@ -126,7 +130,7 @@ struct PanelView: View {
             codebuddy: showCodeBuddy,
             deepseekHarness: showDeepSeekHarness,
             opencode: showOpenCode, qwencode: showQwenCode, kimicode: showKimiCode,
-            musecode: showMuseCode, cmdcode: showCmdCode,
+            musecode: showMuseCode, cmdcode: showCmdCode, copilot: showCopilot,
             devin: showDevin, minimax: showMiniMax
         )
     }
@@ -138,7 +142,7 @@ struct PanelView: View {
          showOpenClaw, showPi, showWorkBuddy, showWorkBuddyAI, showDeepSeekHarness,
          showCodeBuddy,
          showOpenCode, showQwenCode,
-         showQwenWork, showKimiCode, showMuseCode, showCmdCode, showPrimeAgent, showDevin,
+         showQwenWork, showKimiCode, showMuseCode, showCmdCode, showCopilot, showPrimeAgent, showDevin,
          showMiniMax].filter { $0 }.count
     }
     private var hasMultipleDevices: Bool { store.syncEnabled && !store.peers.isEmpty }
@@ -437,13 +441,14 @@ struct PanelView: View {
         let zaiUsage = u.zai.usage?.ranges.get(sel) ?? TokenUsageRange()
         let qcr = u.qwencode.ranges.get(sel), kcr = u.kimicode.ranges.get(sel)
         let mcr = u.musecode.ranges.get(sel), ccr = u.cmdcode.ranges.get(sel)
+        let cpr = u.copilot.ranges.get(sel)
         let dvr = u.devin.ranges.get(sel), mmr = u.minimax.ranges.get(sel)
         let items: [ToolCardItem] = [
             ToolCardItem(id: "claude", name: ClaudeAccountDisplayNames.title(for: "claude", in: claudeAccountDisplayNames), visible: showClaude,
                          active: cr.sessions > 0 || claudeMain.q5 != nil ||
                              claudeMain.q7 != nil || claudeMain.qf != nil,
                          tint: Theme.claude,
-                         content: AnyView(claudeBlock(claudeMain, cr, title: ClaudeAccountDisplayNames.title(for: "claude", in: claudeAccountDisplayNames)))),
+                         content: AnyView(claudeBlock(claudeMain, cr, title: ClaudeAccountDisplayNames.title(for: "claude", in: claudeAccountDisplayNames), showCycleSpend: u.claude.accountNames.isEmpty))),
             ToolCardItem(id: "codex", name: "Codex", visible: showCodex,
                          active: xr.sessions > 0 || u.codex.p5 != nil || u.codex.pw != nil ||
                              (u.codex.reset_cards?.count ?? 0) > 0,
@@ -459,6 +464,7 @@ struct PanelView: View {
                          content: AnyView(providerQuotaBlock(
                             "Cursor", quota: u.cursor, usage: cursorUsage,
                             modelsOpen: $cursorModelsOpen, tint: Theme.cursor,
+                            toolID: "cursor",
                             setupHint: L("请确认 Cursor.app 已登录；Tokei 会复用其本地登录态读取额度。")))),
             ToolCardItem(id: "zed", name: "Zed", visible: showZed, active: showZed,
                          tint: Theme.zed, presentation: .compactStatus,
@@ -477,6 +483,7 @@ struct PanelView: View {
                          content: AnyView(providerQuotaBlock(
                             "z.ai / GLM", quota: u.zai, usage: zaiUsage,
                             modelsOpen: $zaiModelsOpen, tint: Theme.zai,
+                            toolID: "zai",
                             setupHint: L("请在设置的「Provider 额度」中选择区域并保存 API Key。")))),
             ToolCardItem(id: "grok", name: "Grok", visible: showGrok,
                          active: kr.sessions > 0 || kr.usage_calls > 0 || u.grok.pct != nil,
@@ -575,6 +582,10 @@ struct PanelView: View {
                          tint: Theme.musecode, content: AnyView(tokenUsageBlock(title: "Muse Code", mcr, tint: Theme.musecode, modelsOpen: $museCodeModelsOpen, reasonIncludedInOutput: true, toolID: "musecode"))),
             ToolCardItem(id: "cmdcode", name: "Command Code", visible: showCmdCode, active: ccr.sessions > 0,
                          tint: Theme.cmdcode, content: AnyView(tokenUsageBlock(title: "Command Code", ccr, tint: Theme.cmdcode, modelsOpen: $cmdCodeModelsOpen, toolID: "cmdcode"))),
+            ToolCardItem(id: "copilot", name: "GitHub Copilot", visible: showCopilot,
+                         active: cpr.sessions > 0 || cpr.credits > 0,
+                         tint: Theme.copilot,
+                         content: AnyView(copilotOutputBlock(cpr))),
         ]
         // 额外 Claude Code 账号各自一张卡，紧跟默认账号；排序时由 UsageCardOrdering 按各自用量归位。
         let accountCards: [ToolCardItem] = u.claude.accountNames.map { name in
@@ -586,7 +597,7 @@ struct PanelView: View {
                 active: range.sessions > 0 || range.tokens > 0 ||
                     stat.q5 != nil || stat.q7 != nil || stat.qf != nil,
                 tint: Theme.claude,
-                content: AnyView(claudeBlock(stat, range, title: title, toolID: nil)))
+                content: AnyView(claudeBlock(stat, range, title: title, toolID: nil, showCycleSpend: false)))
         }
         var all = items
         all.insert(contentsOf: accountCards, at: min(1, all.count))
@@ -623,7 +634,7 @@ struct PanelView: View {
     // MARK: - Claude 卡片
     @ViewBuilder
     func claudeBlock(_ c: ClaudeStat, _ r: ClaudeRange, title: String = "Claude Code",
-                     toolID: String? = "claude") -> some View {
+                     toolID: String? = "claude", showCycleSpend: Bool = true) -> some View {
         let quotaState = SubscriptionQuotaState.resolve([
             (value: c.q5, stale: c.q5_stale),
             (value: c.q7, stale: c.q7_stale),
@@ -668,6 +679,10 @@ struct PanelView: View {
                 if let q7 = c.q7 {
                     quotaRow(title: L("周 · 全部剩余"), pct: 100 - q7, reset: c.q7_reset,
                              tint: Theme.claude, stale: c.q7_stale == true)
+                    // 周期账单按工具汇总，尚未按账号拆分，多账号卡片不能冒充各自的周期费用。
+                    if showCycleSpend {
+                        cycleSpendRow("claude", reset: c.q7_reset)
+                    }
                 }
                 if let qf = c.qf {
                     quotaRow(title: L("周 · Fable 剩余"), pct: 100 - qf, reset: c.qf_reset,
@@ -728,6 +743,7 @@ struct PanelView: View {
             if let pw = x.pw {
                 quotaRow(title: L("周剩余"), pct: 100 - pw, reset: x.rw,
                          tint: Theme.codex, stale: x.pw_stale == true)
+                cycleSpendRow("codex", reset: x.rw)
             }
             // Reserve 常驻:额度行跟 5h/周排在一起;按模型紧跟额度行,不跟重置卡/plan隔开。
             if let q = x.reserveQuota, let pct = q.usedPercent {
@@ -949,7 +965,8 @@ struct PanelView: View {
                         let hit = denom > 0 ? Double(m.cached) / Double(denom) * 100 : 0
                         return ModelRow(name: m.name, pin: m.pin, pout: m.pout, pcr: m.pcr ?? 0,
                                         cost: m.cost, total: total, hit: hit,
-                                        tokIn: m.in, tokOut: m.out, tokCR: m.cached, tokCW: m.thoughts)
+                                        tokIn: m.in, tokOut: m.out, tokCR: m.cached, tokCW: m.thoughts,
+                                        perf: r.perf?.model(named: m.name))
                     }
                     modelDisclosure(geminiRows, open: $geminiModelsOpen, tint: Theme.gemini,
                                     periodLabel: usageLabel)
@@ -1019,14 +1036,16 @@ struct PanelView: View {
         usage: TokenUsageRange? = nil,
         modelsOpen: Binding<Bool>? = nil,
         tint: Color,
+        toolID: String? = nil,
+        range: RangeKey? = nil,
         setupHint: String
     ) -> some View {
-        let range = usage ?? TokenUsageRange()
-        let hasUsage = range.totalTokens > 0 || range.requests > 0
+        let rangeData = usage ?? TokenUsageRange()
+        let hasUsage = rangeData.totalTokens > 0 || rangeData.requests > 0
         VStack(alignment: .leading, spacing: 11) {
-            cardHeadPlain(title, tint: tint)
+            cardHeadPlain(title, tint: tint, toolID: hasUsage ? toolID : nil, range: range)
             if hasUsage {
-                providerTokenUsageContent(range, modelsOpen: modelsOpen, tint: tint)
+                providerTokenUsageContent(rangeData, modelsOpen: modelsOpen, tint: tint)
             }
             if quota.available {
                 if hasUsage { thinDivider }
@@ -1200,8 +1219,10 @@ struct PanelView: View {
         let hasActivity = r.sessions > 0 || r.calls > 0 || r.turns > 0
         let hasUsage = usage.totalTokens > 0 || usage.requests > 0
         VStack(alignment: .leading, spacing: 11) {
-            cardHead("Grok Bot", tint: Theme.grokBot, sessions: r.sessions,
-                     toolID: hasActivity && displayedRange == sel ? "grok-bot" : nil)
+            cardHead("Grok Bot", tint: Theme.grokBot,
+                     sessions: r.sessions > 0 ? r.sessions : usage.sessions,
+                     toolID: (hasActivity || hasUsage) ? "grok-bot" : nil,
+                     range: displayedRange)
             if hasUsage {
                 if displayedRange != sel {
                     Text(L("%@暂无活动，显示%@最近记录", sel.label, displayedRange.label))
@@ -1371,6 +1392,7 @@ struct PanelView: View {
                 // 总剩余：同一周额度池。分产品 usagePercent 是该产品在池内的占用占比，不是独立额度剩余。
                 quotaRow(title: title, pct: 100 - pct, reset: g.reset,
                          tint: Theme.grok, stale: g.stale == true)
+                cycleSpendRow("grok", reset: g.reset)
                 // 周期结束后，分产品占比说的是上一个周期，不再列出
                 ForEach(periodEnded ? [] : g.products.filter { $0.pct != nil }) { product in
                     if let used = product.pct {
@@ -1905,6 +1927,26 @@ struct PanelView: View {
 
     // MARK: - Token usage cards
     @ViewBuilder
+    func copilotOutputBlock(_ r: TokenUsageRange) -> some View {
+        VStack(alignment: .leading, spacing: 11) {
+            cardHead("GitHub Copilot", tint: Theme.copilot, sessions: r.sessions, toolID: "copilot")
+            if r.sessions > 0 || r.out + r.reason > 0 || r.credits > 0 {
+                CostHeadline(value: Fmt.human(r.out + r.reason), caption: "\(sel.label) · \(L("仅输出"))", tint: Theme.copilot)
+                let premium: [Metric] = r.credits > 0
+                    ? [.init("circle.hexagongrid.fill", "Premium Requests", Fmt.credits(r.credits))] : []
+                metricGrid([], hit: 0, extra: premium + [
+                    .init("arrow.up", L("输出"), Fmt.human(r.out)),
+                    .init("brain", L("推理"), Fmt.human(r.reason))
+                ], tint: Theme.copilot)
+                ForEach(r.models) { model in
+                    Text("\(L10n.data(model.name)) · \(L("仅输出")): \(Fmt.human(model.out + model.reason)) (\(L("输出")) \(Fmt.human(model.out)) · \(L("推理")) \(Fmt.human(model.reason)))")
+                        .font(.system(size: Theme.fontSize(10)))
+                        .foregroundStyle(Theme.tSecondary)
+                }
+            } else { emptyHint }
+        }
+    }
+
     func tokenUsageBlock(title: String, _ r: TokenUsageRange, tint: Color,
                          modelsOpen: Binding<Bool>, inclusiveIO: Bool = false,
                          showsCost: Bool = true, showsCredits: Bool = false,
@@ -2144,7 +2186,7 @@ struct PanelView: View {
         return denom > 0 ? Double(m.cr) / Double(denom) * 100 : 0
     }
 
-    func cardHead(_ title: String, tint: Color, sessions: Int = 0, toolID: String? = nil, fitTitle: Bool = false) -> some View {
+    func cardHead(_ title: String, tint: Color, sessions: Int = 0, toolID: String? = nil, range: RangeKey? = nil, fitTitle: Bool = false) -> some View {
         HStack(spacing: 7) {
             Circle().fill(tint.gradient).frame(width: 8, height: 8)
                 .shadow(color: tint.opacity(0.6), radius: 3)
@@ -2160,29 +2202,29 @@ struct PanelView: View {
             }
             Spacer()
             if let toolID {
-                cardCopyButton(toolID: toolID, tint: tint)
+                cardCopyButton(toolID: toolID, tint: tint, range: range)
             }
         }
     }
 
     // 无命中环的卡头(Grok 无缓存命中数据)。
-    func cardHeadPlain(_ title: String, tint: Color, toolID: String? = nil) -> some View {
+    func cardHeadPlain(_ title: String, tint: Color, toolID: String? = nil, range: RangeKey? = nil) -> some View {
         HStack(spacing: 7) {
             Circle().fill(tint.gradient).frame(width: 8, height: 8)
                 .shadow(color: tint.opacity(0.6), radius: 3)
             Text(title).font(.system(size: Theme.fontSize(14), weight: .bold))
             Spacer()
             if let toolID {
-                cardCopyButton(toolID: toolID, tint: tint)
+                cardCopyButton(toolID: toolID, tint: tint, range: range)
             }
         }
     }
 
     @ViewBuilder
-    private func cardCopyButton(toolID: String, tint: Color) -> some View {
+    private func cardCopyButton(toolID: String, tint: Color, range: RangeKey? = nil) -> some View {
         let done = copiedToolID == toolID
         Button {
-            copySingleToolImage(id: toolID)
+            copySingleToolImage(id: toolID, range: range)
         } label: {
             Image(systemName: done ? "checkmark" : "photo.on.rectangle")
                 .font(.system(size: Theme.fontSize(10), weight: .semibold))
@@ -2615,6 +2657,37 @@ struct PanelView: View {
                       : (reset != nil ? L("%@ 后重置", Fmt.countdown(reset)) : ""))
     }
 
+    /// 额度行下面的「从上次重置到现在花了多少」。数据来自额度曲线页同一份周期统计，
+    /// 已合并所有设备；周期已经翻篇（还没刷到新周期）时不显示，免得算上旧周期的钱。
+    @ViewBuilder
+    func cycleSpendRow(_ tool: String, reset: Int?) -> some View {
+        if let cycle = cycleDetail.payload?.currentCycle(for: tool, endingAt: reset),
+           let cost = cycle.costLabel {
+            HStack(spacing: 5) {
+                Text(L("本周期已花"))
+                    .font(.system(size: Theme.fontSize(11)))
+                    .foregroundStyle(Theme.tSecondary)
+                    .lineLimit(1)
+                    .fixedSize()
+                Text(L("自 %@", Fmt.day(cycle.start)))
+                    .font(.system(size: Theme.fontSize(9.5), design: .monospaced))
+                    .foregroundStyle(Theme.tTertiary)
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                // 金额和 token 数不许折行，窄的时候让「自 xx-xx」去截断
+                Text("≈ \(cost)")
+                    .font(.system(size: Theme.fontSize(12), weight: .semibold, design: .monospaced))
+                    .foregroundStyle(Theme.tPrimary)
+                    .fixedSize()
+                Text("· \(cycle.approx ? "≈" : "")\(Fmt.human(cycle.tokens))")
+                    .font(.system(size: Theme.fontSize(9.5), design: .monospaced))
+                    .foregroundStyle(Theme.tTertiary)
+                    .fixedSize()
+            }
+            .help(Fmt.reset(cycle.start) + " → " + L("上次额度重置到现在，所有设备合计，按 API 价折算"))
+        }
+    }
+
     @ViewBuilder
     func claudeQuotaStatus(_ stat: ClaudeStat) -> some View {
         // 读数的来源是一起刷新的：只要还有一个窗口是新的，其余过期的只是窗口翻篇（行上写「已重置」）
@@ -2686,13 +2759,14 @@ struct PanelView: View {
     }
 
     /// Generate a single-tool share card (native-style) for one agent/card.
-    private func copySingleToolImage(id: String) {
+    private func copySingleToolImage(id: String, range: RangeKey? = nil) {
+        let targetRange = range ?? sel
         guard let usage = store.usage,
               let line = UsageSummaryBuilder.line(
-                forToolID: id, usage: usage, range: sel, visibility: toolVisibility
+                forToolID: id, usage: usage, range: targetRange, visibility: toolVisibility
               ) else { return }
         let ok = UsageShareImage.copyToPasteboard(
-            line: line, range: sel, updated: store.lastUpdated
+            line: line, range: targetRange, updated: store.lastUpdated
         )
         guard ok else { return }
         copyFeedback = false
@@ -2783,7 +2857,7 @@ struct PanelView: View {
     }
 
     @ObservedObject private var updater = Updater.shared
-    @ObservedObject private var loginItem = LoginItemManager.shared
+    @ObservedObject private var loginItem = Shot.isOffline ? Shot.offlineLoginItem : LoginItemManager.shared
     @State private var priceUpdating = false
     @State private var priceResult = ""
     @State private var debugRunning = false
@@ -3182,6 +3256,7 @@ struct PanelView: View {
                 settingsRow("Kimi Code", tint: Theme.kimicode, isOn: $showKimiCode)
                 settingsRow("Muse Code", tint: Theme.musecode, isOn: $showMuseCode)
                 settingsRow("Command Code", tint: Theme.cmdcode, isOn: $showCmdCode)
+                settingsRow("GitHub Copilot", tint: Theme.copilot, isOn: $showCopilot)
                 settingsRow("Devin", tint: Theme.devin, isOn: $showDevin)
                 settingsRow("MiniMax Code", tint: Theme.minimax, isOn: $showMiniMax)
             }
@@ -4330,7 +4405,7 @@ struct PanelView: View {
                          "zcode", "mimocode", "openclaw", "pi", "workbuddy", "workbuddy_ai",
                          "codebuddy",
                          "deepseek_harness",
-                         "opencode", "qwencode", "qwenwork", "kimicode", "musecode", "cmdcode", "prime_agent",
+                         "opencode", "qwencode", "qwenwork", "kimicode", "musecode", "cmdcode", "copilot", "prime_agent",
                          "devin", "minimax"]
                 .filter { json[$0] != nil }
                 .joined(separator: ",")

@@ -59,6 +59,7 @@ Tokei 是一款 **macOS 菜单栏应用**，实时追踪 20+ 款 AI 编程工具
 | **Kimi Code** | Token（输入/输出/缓存）、会话、模型、项目、配额（5h / 订阅周期） |
 | **Muse Code** | Token（输入/输出/缓存/推理）、成本、模型、项目 |
 | **Command Code** | Token（输入/输出/缓存）、成本、模型、项目 |
+| **GitHub Copilot** | 已核实输出（含推理，Output only）、Premium Requests、会话、模型、项目（本地日志） |
 | **Devin** | Token（输入/输出/缓存）、成本、模型、会话；日/周/消息额度、套餐与账号、超额余额 |
 | **MiniMax Code** | Token（输入/输出/缓存）、成本、模型、会话、项目；可选 Token Plan 5 小时 / 周额度（填入 Key 后联网查询） |
 
@@ -73,10 +74,11 @@ Tokei 是一款 **macOS 菜单栏应用**，实时追踪 20+ 款 AI 编程工具
 ### 成本估算
 - 基于 API 实际定价估算成本（非订阅费用）
 - CodeBuddy 优先展示产品原生 Credit；没有精确价格的模型不会冒充美元成本
-- 317 个模型价格表（来源 OpenRouter），支持一键更新
+- 后台每天更新 OpenRouter 模型目录，并核对 OpenAI 官网 Standard 价格；发现缺价模型时提前检查，Mac / Windows 共用
 - DeepSeek Harness 官方路由按请求时间使用工作日北京时间潮汐价格；OpenRouter 等其他路由仍按价格表计算
-- 本地价格覆盖（`pricing_overrides.json`），更新不丢失
-- 未知模型按家族关键词回退，兜底用 Opus 价格（保守上限）
+- 核对结果保留来源与时间；价格变化后重算缓存费用，不清除 Token 历史，失败时继续使用上次有效价格
+- 本地价格覆盖（`pricing_overrides.json`），自定义值仍优先；安装时复制的内置默认值会跟随官方核价更新
+- 未知模型沿用同档位上一版或已有兜底价，Codex 模型明细会标明估算参照；详见[自动价格核对](docs/automatic-pricing.md)
 
 ### 数据面板
 - 每日成本折线图
@@ -120,7 +122,7 @@ Tokei 是一款 **macOS 菜单栏应用**，实时追踪 20+ 款 AI 编程工具
 - Cursor 与 z.ai 的账号级统计在 Dashboard 中单独展示；Grok Bot 本地快照没有 Token 字段，因此官方模型用量直接并入“模型用量”，额度仅在 Grok Bot 主卡片展示
 - 开启多设备同步后，Grok Bot 的官方 Token、模型、费用和额度汇总会进入同步快照；界面采用时间最新的一份账号数据，不会按设备重复相加
 - Grok Bot 额度按实时状态过期；已采集的 Token、模型和费用按日期长期保留，后续成功查询只更新对应日期，不会因授权或网络暂时失效而清空
-- Antigravity 额度只连接已运行客户端的 `127.0.0.1` language server，不会自动启动客户端
+- Antigravity 额度只连接已运行客户端的 `127.0.0.1` language server，不会自动启动客户端；CSRF 凭据取自进程环境或 IDE 的 `daemon/ls_*.json`，端口已失效的旧凭据会被丢弃；接口提供 Gemini 4 Argon 独立周额度时单独展示，与原有 Gemini 共享额度分开
 - 这 5 个 Provider 的额度与账号标签只保存在本机缓存，不写入多设备 Git 同步快照
 - 其他联网操作包括检查/下载更新，以及手动更新模型价格表
 - CodeBuddy 只读取本地 `~/.codebuddy/projects` 会话 JSONL；不读取 auth、local storage、trace、日志或会话正文，也不会发起账户额度请求
@@ -212,7 +214,7 @@ chmod +x ~/.tokei/tokei-sync.sh
 | Grok Build | `${GROK_HOME:-~/.grok}/logs/unified.jsonl`（含真实 token + billing 额度）+ `sessions/*/*/{summary,signals}.json`；可选实时账单接口（设置里默认关闭） |
 | Grok Bot | `~/Library/Application Support/Grok Bot/sand-client-persistence/*.blob`（本地活动）；可选 Sand 官方 usage-events / 额度接口（首次需授权 Grok Bot 钥匙串，设置里默认关闭） |
 | Hermes | `~/.hermes/state.db` + `~/.hermes/profiles/*/state.db` |
-| OpenClaw | `~/.openclaw/state/openclaw.sqlite` 动态发现 agent SQLite；兼容旧版 `agents/*/sessions/*.jsonl` |
+| OpenClaw | `~/.openclaw/state/openclaw.sqlite` 动态发现 agent SQLite；`transcript_events` 正文兼容 `event_json` 与 `event_zstd`（Python 3.14+ 标准库或已安装的 zstandard 解码）两种存储；兼容旧版 `agents/*/sessions/*.jsonl` |
 | Pi Coding Agent CLI | `~/.pi/agent/sessions/<project>/*.jsonl` |
 | Prime Agent | `~/.prime/agent/sessions/*.jsonl` + `session-artifacts/**/**/*.jsonl` |
 | WorkBuddy | `~/.workbuddy/projects/<project>/*.jsonl` |
@@ -410,3 +412,14 @@ For full documentation, visit [tokei.lanshuagent.com](https://tokei.lanshuagent.
 ## License
 
 MIT
+
+### GitHub Copilot 计量覆盖
+
+Copilot 目前只统计可核实的输出（含推理），卡片、概览和分享标注 **Output only**。
+推理是原始输出的子集，规范化为非推理输出 `out = rawOutput - min(rawOutput, rawReason)`，推理独立存储，已知总量 `out + reason` 只计算一次。
+Premium Requests 独立展示，不推测剩余额度。输入、缓存读/写及完整 API 成本暂缓展示或计入总量；原始数字只作为本地缓存元数据保留。
+输入/缓存包含关系仍待 runtime owner 确认，见 [SDK issue #2834](https://github.com/github/copilot-sdk/issues/2834) 和 [SDK PR #2837](https://github.com/github/copilot-sdk/pull/2837)。
+reasoning 子集定义见 [官方 assistant.usage 文档](https://docs.github.com/en/copilot/how-tos/copilot-sdk/features/streaming-events#assistantusage)。模型、项目和账本也采用相同已知输出口径。
+
+Copilot 同时发现 SQLite 与 JSONL 时，数据库有效用量行的全部会话 ID 优先；JSONL 只补充数据库未覆盖的会话。
+物理路径会解析符号链接去重；不按时间或 token 相等推测来源重叠。数据库已覆盖的会话不会另外叠加 JSONL 用量或 Premium Requests。

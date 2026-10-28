@@ -1,14 +1,15 @@
 {
   "name": "tokei-windows",
   "private": true,
-  "version": "1.0.47",
+  "version": "1.0.48",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && node scripts/check-i18n.mjs && vite build && node scripts/check-startup-budget.mjs",
     "check:i18n": "node scripts/check-i18n.mjs",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "test": "node --test"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
