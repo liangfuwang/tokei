@@ -152,7 +152,12 @@ struct DoubaoWorkCheck {
         try expect(allLine.sessions == 2 && allLine.activityLabel == "累计会话", "all uses cumulative conversations")
         var liveQuotaStat = stat([a, b])
         var liveQuota = quotaJSON
-        liveQuota["updated"] = Int(Date().timeIntervalSince1970)
+        let liveEpoch = Int(Date().timeIntervalSince1970)
+        liveQuota["updated"] = liveEpoch
+        liveQuota["windows"] = [["window_type": 2, "used_percent": 20,
+                                 "start_time_ms": (liveEpoch - 1000) * 1000,
+                                 "end_time_ms": (liveEpoch + 604800) * 1000,
+                                 "less_than_one_percent": false]]
         liveQuotaStat["quota"] = liveQuota
         let liveQuotaUsage = try fixture(liveQuotaStat)
         let quotaLine = UsageSummaryBuilder.line(forToolID: "doubaowork", usage: liveQuotaUsage,
