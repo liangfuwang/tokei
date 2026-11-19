@@ -28,7 +28,8 @@
 #                额度默认关闭；授权后由 Tokei 原生 helper 临时读取 Keychain 登录态
 #   Doubao Work: Application Support / APPDATA / DoubaoWork 的 IndexedDB 缓存
 #                (只统计已缓存的 Agent 新建会话，不估算 Token / 成本 / 速率)
-#   DeepSeek:    ~/.dsh/sessions/**/*.jsonl.zstd (由 App 原生解压后增量扫描)
+#   DeepSeek:    ~/.dsh/sessions/**/*.jsonl.zstd (优先 App 原生解压缓存;
+#                无缓存平台由采集器流式解压直接扫描)
 #   Qwen Code:   ~/.qwen/usage/token-usage-*.jsonl (逐请求,usage_record.jsonl 补历史)
 #   Kimi Code:   ${KIMI_CODE_HOME:-~/.kimi-code}/sessions/*/*/agents/*/wire.jsonl
 #                兼容旧版 ${KIMI_SHARE_DIR:-~/.kimi}/sessions/*/*/wire.jsonl
@@ -228,6 +229,9 @@ GROK_BOT_AUTH_MARKER = _expand_path(os.environ.get(
     os.path.join(HOME, ".tokei", "grok_bot_keychain_authorized")))
 DEEPSEEK_HARNESS_DIR = os.path.abspath(os.path.expanduser(os.environ.get(
     "TOKEI_DSH_DECOMPRESSED_DIR", os.path.join(HOME, ".tokei", "cache", "dsh-sessions"))))
+# 与 Mac 端 DataLoader 的 TOKEI_DSH_DIR 一致：原始（未解压）会话目录。
+DEEPSEEK_HARNESS_RAW_DIR = os.path.abspath(os.path.expanduser(os.environ.get(
+    "TOKEI_DSH_DIR", os.path.join(HOME, ".dsh", "sessions"))))
 QODER_IDE_DB = os.path.join(HOME, "Library", "Application Support", "Qoder",
                             "SharedClientCache", "cache", "db", "local.db")
 QODER_IDE_DB_PATHS = _path_candidates(
@@ -2086,6 +2090,31 @@ def token_total(day):
 
 def _sqlite_ro_uri(path):
     return Path(path).resolve().as_uri() + "?mode=ro"
+
+
+def _sqlite_open_readonly(path, timeout=5.0, module=None):
+    """只读打开 SQLite 库，WAL 库被写方 checkpoint 清掉侧车后仍可打开。
+
+    工具干净退出（如 ZCode）会 checkpoint 并删除 -wal/-shm 侧车，但主库文件头仍是
+    WAL 模式，mode=ro 连接重建 wal-index 需要写权限，会直接 OperationalError。
+    此时主库文件已包含全部已提交行，降级 immutable=1 绕过 wal-index 即可打开；
+    侧车仍存在且非空时保持普通只读连接——immutable 会忽略 WAL，读到旧数据。
+    """
+    module = module or sqlite3
+    try:
+        conn = module.connect(_sqlite_ro_uri(path), uri=True, timeout=timeout)
+        conn.execute("SELECT 1")
+        return conn
+    except module.OperationalError:
+        try:
+            has_pending_wal = os.path.getsize(str(path) + "-wal") > 0
+        except OSError:
+            has_pending_wal = False
+        if has_pending_wal:
+            raise
+        conn = module.connect(_sqlite_ro_uri(path) + "&immutable=1", uri=True, timeout=timeout)
+        conn.execute("SELECT 1")
+        return conn
 
 
 def _sqlite_signature(path):
@@ -4596,11 +4625,8 @@ class _CodexZstdStream:
                     process.wait(timeout=1)
 
 
-def _open_codex_rollout(path):
-    """Open a rollout without rewriting the compressed source."""
-    path = os.fspath(path)
-    if not path.endswith(".zst"):
-        return open(path, "rb", buffering=0)
+def _open_zstd_stream(path):
+    """Open a zstd-compressed file as a binary stream (stdlib 3.14+ / zstandard / zstd CLI)."""
     stream = None
     try:
         from compression import zstd as _zstd  # Python 3.14+
@@ -4637,6 +4663,14 @@ def _open_codex_rollout(path):
             continue
         return _CodexZstdStream(process.stdout, process)
     raise OSError("no zstd decoder available")
+
+
+def _open_codex_rollout(path):
+    """Open a rollout without rewriting the compressed source."""
+    path = os.fspath(path)
+    if not path.endswith(".zst"):
+        return open(path, "rb", buffering=0)
+    return _open_zstd_stream(path)
 
 
 def _iter_codex_usage_records(path, chunk_size=64 * 1024, header_limit=1024,
@@ -5782,7 +5816,7 @@ def _load_antigravity_db(path):
     max_ts = ""
     conn = None
     try:
-        conn = sqlite3.connect(_sqlite_ro_uri(path), uri=True, timeout=1)
+        conn = _sqlite_open_readonly(path, timeout=1)
         rows = conn.execute("SELECT idx, data FROM gen_metadata ORDER BY idx ASC").fetchall()
         try:
             step_rows = conn.execute("SELECT idx, metadata FROM steps").fetchall()
@@ -7467,7 +7501,7 @@ def _cursor_app_session(path=None, now_epoch=None):
     if not db_path or not os.path.isfile(db_path):
         return None
     try:
-        connection = sqlite3.connect(_sqlite_ro_uri(db_path), uri=True, timeout=0.25)
+        connection = _sqlite_open_readonly(db_path, timeout=0.25)
         row = connection.execute(
             "SELECT value FROM ItemTable WHERE key = ? LIMIT 1",
             ("cursorAuth/accessToken",)).fetchone()
@@ -9779,7 +9813,7 @@ def _devin_plan(db_path):
     rows = []
     conn = None
     try:
-        conn = _sq.connect(_sqlite_ro_uri(db_path), uri=True, timeout=1)
+        conn = _sqlite_open_readonly(db_path, timeout=1)
         conn.execute("PRAGMA query_only=ON")
         for pattern in _DEVIN_PLAN_KEY_PATTERNS:
             found = list(conn.execute(
@@ -10263,7 +10297,7 @@ def scan_qoder(bounds, cache):
         if sig and (not entry or entry.get("sig") != sig):
             conn = None
             try:
-                conn = _sqlite3.connect(_sqlite_ro_uri(qoder_db), uri=True, timeout=1)
+                conn = _sqlite_open_readonly(qoder_db, timeout=1)
                 conn.execute("PRAGMA query_only=ON")
                 # messages: calls, sessions, tokens, duration, turns
                 # 只统计 assistant 行:user 行也可能带 metadata,会虚增任务数
@@ -10427,7 +10461,7 @@ def scan_qoder_ide(bounds, cache):
         latest_model = None
         conn = None
         try:
-            conn = _sq.connect(_sqlite_ro_uri(qoder_ide_db), uri=True, timeout=1)
+            conn = _sqlite_open_readonly(qoder_ide_db, timeout=1)
             conn.execute("PRAGMA query_only=ON")
             # token 用量 & 计数 per day
             for row in conn.execute("""
@@ -10610,7 +10644,7 @@ def _hermes_db_paths():
 def _scan_hermes_db(db_path, _sq):
     days = {}
     try:
-        conn = _sq.connect(_sqlite_ro_uri(db_path), uri=True)
+        conn = _sqlite_open_readonly(db_path)
         conn.row_factory = _sq.Row
 
         tables = {row[0] for row in conn.execute(
@@ -11284,7 +11318,7 @@ def _openclaw_db_paths():
 
 
 def _openclaw_connect(db_path, sqlite_module):
-    conn = sqlite_module.connect(_sqlite_ro_uri(db_path), uri=True, timeout=1)
+    conn = _sqlite_open_readonly(db_path, timeout=1, module=sqlite_module)
     conn.execute("PRAGMA query_only=ON")
     return conn
 
@@ -13890,17 +13924,53 @@ def _iter_deepseek_harness_records(file_cache):
         yield path, entry, record
 
 
+class _DshZstdLines:
+    """Iterate a zstd-compressed DeepSeek Harness session as decoded lines."""
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return self._stream.__exit__(*exc_info)
+
+    def __iter__(self):
+        while True:
+            raw = self._stream.readline()
+            if not raw:
+                break
+            yield raw.decode("utf-8", "ignore")
+
+
+def _open_dsh_session(path):
+    """Open a harness session for line iteration; raw .jsonl.zstd streams through zstd."""
+    if path.endswith(".zstd"):
+        return _DshZstdLines(_open_zstd_stream(path))
+    return open(path, "r", encoding="utf-8", errors="ignore")
+
+
 def scan_deepseek_harness(bounds, cache):
     ledger_touch("deepseek_harness")
     fc = cache.setdefault("deepseek_harness", {})
     B = _empty_token_ranges()
-    if not os.path.isdir(DEEPSEEK_HARNESS_DIR):
+    # macOS App 先把 ~/.dsh/sessions 解压到 DEEPSEEK_HARNESS_DIR 再增量扫描；
+    # 其余平台没有原生解压方，退回直接流式读原始 .jsonl.zstd。缓存签名按源文件
+    # 的 mtime/size，未变更的会话不会重复解压解析。
+    if os.path.isdir(DEEPSEEK_HARNESS_DIR):
+        source_dir = DEEPSEEK_HARNESS_DIR
+        pattern = "**/*.jsonl"
+    elif os.path.isdir(DEEPSEEK_HARNESS_RAW_DIR):
+        source_dir = DEEPSEEK_HARNESS_RAW_DIR
+        pattern = "**/*.jsonl.zstd"
+    else:
         if fc:
             fc.clear()
             cache["_dirty"] = True
         return {"ranges": B}
 
-    files = set(glob.glob(os.path.join(DEEPSEEK_HARNESS_DIR, "**", "*.jsonl"), recursive=True))
+    files = set(glob.glob(os.path.join(source_dir, pattern), recursive=True))
     stale = set(fc.keys())
     for path in sorted(files):
         stale.discard(path)
@@ -13913,7 +13983,10 @@ def scan_deepseek_harness(bounds, cache):
                 and fc[path].get("cost_version") == _DEEPSEEK_HARNESS_COST_VERSION):
             continue
 
-        session_id = os.path.splitext(os.path.basename(path))[0]
+        name = os.path.basename(path)
+        if name.endswith(".zstd"):
+            name = name[: -len(".zstd")]
+        session_id = os.path.splitext(name)[0]
         project = ""
         current_model = "deepseek-v4-pro"
         current_provider = "deepseek-official"
@@ -13921,7 +13994,7 @@ def scan_deepseek_harness(bounds, cache):
         # 每个 step 的请求开始、第一个内容块、流结束时间（毫秒），重试时从重试那一刻重新算
         timing = {}
         try:
-            with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+            with _open_dsh_session(path) as handle:
                 for line in handle:
                     if '"type"' not in line or not any(value in line for value in (
                             '"session"', '"request/header"', '"step/start"',
@@ -14210,7 +14283,7 @@ def _scan_opencode_database(path, estimate_missing_cost=False):
     days = {}
     message_ids = set()
     sessions = {}
-    connection = sqlite3.connect(_sqlite_ro_uri(path), uri=True, timeout=1)
+    connection = _sqlite_open_readonly(path, timeout=1)
     try:
         connection.execute("PRAGMA query_only=ON")
         tables = {row[0] for row in connection.execute(
@@ -14414,7 +14487,7 @@ def _scan_zcode_database(path):
 
     days = {}
     sessions = {}
-    connection = sqlite3.connect(_sqlite_ro_uri(path), uri=True, timeout=1)
+    connection = _sqlite_open_readonly(path, timeout=1)
     try:
         connection.execute("PRAGMA query_only=ON")
         rows = connection.execute("""
@@ -14534,7 +14607,7 @@ def _scan_devin_cli_database(path):
     days = {}
     sessions = {}
     seen = set()
-    connection = sqlite3.connect(_sqlite_ro_uri(path), uri=True, timeout=1)
+    connection = _sqlite_open_readonly(path, timeout=1)
     try:
         connection.execute("PRAGMA query_only=ON")
         tables = {row[0] for row in connection.execute(
@@ -14949,7 +15022,7 @@ def _scan_minimax_database(path, pending, runs, through):
         except (TypeError, ValueError, OverflowError):
             return 0
 
-    connection = sqlite3.connect(_sqlite_ro_uri(path), uri=True, timeout=1)
+    connection = _sqlite_open_readonly(path, timeout=1)
     try:
         connection.execute("PRAGMA query_only=ON")
         # 运行中的客户端会继续写入；用量和消息必须读自同一份数据库快照。
